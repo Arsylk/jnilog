@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+
+# xmake artifacts
+.xmake/
+
+# Python/Ruff cache
+.ruff_cache/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Go artifacts
+*.exe
+*.dll
+*.so
+*.a
+*.test
+# Note: build/ is already ignored, but this catches stray artifacts in src/
