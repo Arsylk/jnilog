@@ -221,6 +221,61 @@ int should_log_from_caller(JNIEnv *env, void *caller) {
   return c_is_in_exec_range((uintptr_t)caller);
 }
 
+/* ── Config query cache ───────────────────────────────────────────────────
+ * Each JNI function name crosses cgo exactly once.  Subsequent hits do an
+ * O(1) pointer comparison in a linear-probe hash table.
+ * ──────────────────────────────────────────────────────────────────────── */
+#define CONFIG_CACHE_SIZE 256
+#define CONFIG_CACHE_MASK (CONFIG_CACHE_SIZE - 1)
+
+typedef struct {
+  const char *name;
+  int         result;   /* -1 = unchecked, 0 = blocked, 1 = allowed */
+} config_cache_entry_t;
+
+static config_cache_entry_t g_cfg_cache[CONFIG_CACHE_SIZE];
+static int                  g_cfg_cache_init = 0;
+
+static uint32_t cfg_hash(const char *s) {
+  uint32_t h = 5381;
+  while (*s) h = ((h << 5) + h) + (unsigned char)*s++;
+  return h;
+}
+
+static int cfg_lookup(const char *name, int *out) {
+  if (!g_cfg_cache_init) {
+    memset(g_cfg_cache, 0, sizeof(g_cfg_cache));
+    for (int i = 0; i < CONFIG_CACHE_SIZE; i++) g_cfg_cache[i].result = -1;
+    g_cfg_cache_init = 1;
+  }
+  uint32_t hash = cfg_hash(name);
+  for (int i = 0; i < CONFIG_CACHE_SIZE; i++) {
+    uint32_t idx = (hash + (uint32_t)i) & CONFIG_CACHE_MASK;
+    config_cache_entry_t *e = &g_cfg_cache[idx];
+    if (e->result == -1) {
+      if (config_function_blacklisted((char *)name)) { e->name = name; e->result = 0; *out = 0; return 1; }
+      if (!config_function_enabled((char *)name))  { e->name = name; e->result = 0; *out = 0; return 1; }
+      e->name = name; e->result = 1; *out = 1; return 1;
+    }
+    if (e->name == name) { *out = e->result; return 1; }
+    if (e->name && strcmp(e->name, name) == 0) { e->name = name; *out = e->result; return 1; }
+  }
+  if (config_function_blacklisted((char *)name)) { *out = 0; return 1; }
+  if (!config_function_enabled((char *)name))  { *out = 0; return 1; }
+  *out = 1; return 1;
+}
+
+int config_is_allowed(const char *name) {
+  if (!name) return 0;
+  int result = 0;
+  return cfg_lookup(name, &result) && result;
+}
+
+int should_log_jni(JNIEnv *env, void *caller, const char *jni_name) {
+  if (!config_is_allowed(jni_name)) return 0;
+  return should_log_from_caller(env, caller);
+}
+
 void log_missing_original(const char *name, int should_log) {
   if (should_log) log_native_warn("hook call without original JNI entry: %s", name);
 }

@@ -28,7 +28,7 @@
 /* Global state */
 static int g_initialized = 0;
 static int g_injection_mode = 0;
-static pthread_once_t init_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Original function pointers */
 static jint (*original_JNI_GetCreatedJavaVMs)(JavaVM**, jsize, jsize*) = NULL;
@@ -310,7 +310,13 @@ static void* elf_find_sym(uintptr_t base, const char* sym_name) {
 /* --- Init --- */
 
 static void init_once_handler(void) {
-    if (g_initialized) return;
+    /* g_initialized is process-local — resets to 0 after fork(),
+     * so each new child process correctly re-initializes.
+     * pthread_once would survive fork and skip init in children. */
+    pthread_mutex_lock(&g_init_lock);
+    if (g_initialized) { pthread_mutex_unlock(&g_init_lock); return; }
+    g_initialized = 1;
+    pthread_mutex_unlock(&g_init_lock);
 
     LOG_DIRECT(ANDROID_LOG_INFO, "init_once_handler: starting pid=%d", getpid());
 
@@ -329,7 +335,6 @@ static void init_once_handler(void) {
     install_loader_dlopen_hook();
     try_install_hooks_from_created_vms();
 
-    g_initialized = 1;
     LOG_DIRECT(ANDROID_LOG_INFO, "init_once_handler: initialization successful");
 }
 
@@ -400,7 +405,7 @@ static jint hooked_vm_GetEnv(JavaVM* vm, void** penv, jint version) {
 /* --- Constructor / Destructor --- */
 
 static void* constructor_init_worker(void* arg) {
-    pthread_once(&init_once, init_once_handler);
+    init_once_handler();
     LOG_DIRECT(ANDROID_LOG_INFO, "library constructor: initialization complete");
     return NULL;
 }
@@ -410,7 +415,7 @@ __attribute__((constructor)) void library_constructor(void) {
     
     const char* ld_preload = getenv("LD_PRELOAD");
     if (ld_preload && strstr(ld_preload, "jnilog")) {
-        pthread_once(&init_once, init_once_handler);
+        init_once_handler();
     } else {
         g_injection_mode = 1;
         pthread_t tid;
@@ -429,7 +434,7 @@ __attribute__((destructor)) static void library_destructor(void) {
 /* --- JNI exports --- */
 
 JNIEXPORT jint JNICALL JNI_GetCreatedJavaVMs(JavaVM** p_vm, jsize buf_len, jsize* n_vms) {
-    pthread_once(&init_once, init_once_handler);
+    init_once_handler();
     if (!original_JNI_GetCreatedJavaVMs) return JNI_ERR;
     jint res = original_JNI_GetCreatedJavaVMs(p_vm, buf_len, n_vms);
     if (res == JNI_OK && p_vm && *p_vm) try_install_hooks(*p_vm);
@@ -437,7 +442,7 @@ JNIEXPORT jint JNICALL JNI_GetCreatedJavaVMs(JavaVM** p_vm, jsize buf_len, jsize
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
-    pthread_once(&init_once, init_once_handler);
+    init_once_handler();
     bridge_activate_go();
     try_install_hooks(vm);
     if (original_JNI_OnLoad) return original_JNI_OnLoad(vm, reserved);

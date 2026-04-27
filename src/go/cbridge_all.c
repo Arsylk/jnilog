@@ -7,4 +7,3 @@
 #include "../cbridge/main.c"
 #include "../cbridge/rangeset.c"
 #include "../cbridge/visualize.c"
-#include "../cbridge/vis_encode_typed_args.c"

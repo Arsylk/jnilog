@@ -21,65 +21,14 @@ extern "C" {
 #endif
 
 /* ============================================================================
- * Primitive Value Formatting
- * All functions return dynamically allocated strings that must be freed.
- * ============================================================================ */
-
-char* vis_format_bool(jboolean value);
-char* vis_format_byte(jbyte value);
-char* vis_format_char(jchar value);
-char* vis_format_short(jshort value);
-char* vis_format_int(jint value);
-char* vis_format_long(jlong value);
-char* vis_format_float(jfloat value);
-char* vis_format_double(jdouble value);
-char* vis_format_void(void);
-
-/* ============================================================================
  * Type Detection Helpers
  * ============================================================================ */
 
-int vis_is_array(JNIEnv* env, void* obj);
-int vis_is_primitive_array(JNIEnv* env, void* obj);
-char* vis_get_array_component_type(JNIEnv* env, void* obj);
-
-/* ============================================================================
- * Array Visualization
- * ============================================================================ */
-
-char* vis_format_boolean_array(JNIEnv* env, void* arr);
-char* vis_format_byte_array(JNIEnv* env, void* arr);
-char* vis_format_char_array(JNIEnv* env, void* arr);
-char* vis_format_short_array(JNIEnv* env, void* arr);
-char* vis_format_int_array(JNIEnv* env, void* arr);
-char* vis_format_long_array(JNIEnv* env, void* arr);
-char* vis_format_float_array(JNIEnv* env, void* arr);
-char* vis_format_double_array(JNIEnv* env, void* arr);
-char* vis_format_object_array(JNIEnv* env, void* arr);
-char* vis_format_array(JNIEnv* env, void* arr);
-
-/* ============================================================================
- * Object Type-Specific Handlers
- * ============================================================================ */
-
 int vis_is_string(JNIEnv* env, void* obj);
-int vis_is_boolean_object(JNIEnv* env, void* obj);
-int vis_is_integer_object(JNIEnv* env, void* obj);
-int vis_is_long_object(JNIEnv* env, void* obj);
 int vis_is_class(JNIEnv* env, void* obj);
 
-char* vis_format_boolean_object(JNIEnv* env, void* obj);
-char* vis_format_integer_object(JNIEnv* env, void* obj);
-char* vis_format_long_object(JNIEnv* env, void* obj);
-char* vis_format_string_value(JNIEnv* env, void* str);
-char* vis_format_classloader(JNIEnv* env, void* obj);
-char* vis_format_certificate(JNIEnv* env, void* obj);
-char* vis_format_input_device(JNIEnv* env, void* obj);
-char* vis_format_window_insets(JNIEnv* env, void* obj);
-char* vis_format_preferences_key(JNIEnv* env, void* obj);
-
 /* ============================================================================
- * Existing Visualization Functions
+ * Object Introspection
  * ============================================================================ */
 
 char* vis_class_name(JNIEnv* env, void* clazz_ptr);
@@ -108,15 +57,6 @@ JNIEnv* vis_get_env(void);
  * ============================================================================ */
 char* vis_encode_array_items(JNIEnv* env, void* arr, char itemSigChar);
 char* vis_encode_ptr_array_items(const void* buf, jsize count, char itemSigChar);
-
-/* ============================================================================
- * Main Value Dispatch Function
- * ============================================================================ */
-
-char* vis_format_value(JNIEnv* env, uintptr_t value, const char* sig);
-char* vis_format_object_smart(JNIEnv* env, void* obj);
-char* vis_format_arguments(JNIEnv* env, const char* sig, uintptr_t* args, int arg_count);
-
 
 int extract_va_args(const char* sig, va_list ap, uintptr_t* out, int max_args);
 int extract_jvalue_args(const char* sig, const jvalue* args, uintptr_t* out, int max_args);

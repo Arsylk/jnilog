@@ -136,6 +136,8 @@ int  is_jni_critical(void);
 void set_jni_critical(int val);
 void address_of_r(void *addr, char *buf, size_t bufsz);
 int  should_log_from_caller(JNIEnv *env, void *caller);
+int  should_log_jni(JNIEnv *env, void *caller, const char *jni_name);
+int  config_is_allowed(const char *jni_name);
 void log_missing_original(const char *name, int should_log);
 int  has_no_exception(JNIEnv *env);
 int  protect_region(prot_region_t *region, int prot);
@@ -380,6 +382,13 @@ JNI_FIELD_TYPES(DECLARE_FIELD_GET_HOOKS)
 JNI_FIELD_TYPES(DECLARE_FIELD_SET_HOOKS)
 JNI_FIELD_TYPES(DECLARE_STATIC_FIELD_GET_HOOKS)
 JNI_FIELD_TYPES(DECLARE_STATIC_FIELD_SET_HOOKS)
+
+/* ============================================================================
+ * Release*ArrayElements — paired with Get*ArrayElements hooks (lifecycle completion)
+ * ============================================================================ */
+#define DECLARE_RELEASE_ARRAY_ELEMENTS_HOOKS(Name, CType, ...) \
+  void hooked_Release##Name##ArrayElements(JNIEnv *env, CType##Array array, CType *elems, jint mode);
+JNI_PRIMITIVE_ARRAY_TYPES(DECLARE_RELEASE_ARRAY_ELEMENTS_HOOKS)
 
 /* Critical section hooks */
 void*        hooked_GetPrimitiveArrayCritical(JNIEnv *env, jarray array, jboolean *isCopy);

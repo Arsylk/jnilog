@@ -259,6 +259,7 @@ func goGetLoggingReady() C.int {
 //export goBridgeInit
 func goBridgeInit() {
 	goJNILogInit()
+	loadConfig()
 
 	// By the time goBridgeInit fires, the process has been renamed from
 	// app_process64 to the actual package name.  Read it from cmdline and

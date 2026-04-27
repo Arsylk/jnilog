@@ -15,6 +15,7 @@
 #include <android/log.h>
 #endif
 #include "bridge.h"
+#include "hook_internal.h"
 #include "_cgo_export.h"
 
 static const char* k_log_tag = "JNILogPayload";
@@ -66,11 +67,26 @@ void log_message(const char* format, ...) {
 static const char* (*art_field_get_name)(void*) = NULL;
 
 static void resolve_art_symbols(void) {
-    art_field_get_name = (const char* (*)(void*))dlsym(RTLD_DEFAULT, "_ZN3art8ArtField7GetNameEv");
-    if (art_field_get_name)
-        LOG_DIRECT(ANDROID_LOG_INFO, "Resolved art::ArtField::GetName at %p", (void*)art_field_get_name);
-    else
-        LOG_DIRECT(ANDROID_LOG_WARN, "Failed to resolve art::ArtField::GetName");
+    /* Try multiple mangled names for art::ArtField::GetName across ART versions:
+     *   _ZN3art8ArtField7GetNameEv        — Android 5-13, non-const
+     *   _ZNK3art8ArtField7GetNameEv        — Android 14+, const-qualified
+     *   _ZN3art9ArtField7GetNameEv         — older/alternative ABI
+     */
+    static const char* const kArtFieldGetNameSyms[] = {
+        "_ZN3art8ArtField7GetNameEv",
+        "_ZNK3art8ArtField7GetNameEv",
+        "_ZN3art9ArtField7GetNameEv",
+    };
+    for (size_t i = 0; i < sizeof(kArtFieldGetNameSyms) / sizeof(kArtFieldGetNameSyms[0]); i++) {
+        art_field_get_name = (const char* (*)(void*))dlsym(RTLD_DEFAULT, kArtFieldGetNameSyms[i]);
+        if (art_field_get_name) {
+            LOG_DIRECT(ANDROID_LOG_INFO, "Resolved ArtField::GetName via %s at %p",
+                       kArtFieldGetNameSyms[i], (void*)art_field_get_name);
+            return;
+        }
+    }
+    LOG_DIRECT(ANDROID_LOG_WARN, "Failed to resolve art::ArtField::GetName (tried %zu variants)",
+               sizeof(kArtFieldGetNameSyms) / sizeof(kArtFieldGetNameSyms[0]));
 }
 
 void bridge_init(void) {
@@ -126,6 +142,7 @@ void log_jni_call(
         uintptr_t mid,
         const char* caller) {
     if (!goGetLoggingReady()) return;
+    if (!config_is_allowed(jni_name)) return;
     goJNICallCallback(
         offset,
         (char*)jni_name,
@@ -152,6 +169,7 @@ void log_jni_return(
         const char* ret_str,
         const char* ret_extra) {
     if (!goGetLoggingReady()) return;
+    if (!config_is_allowed(name)) return;
     goJNIReturnCallback(
         offset,
         (char*)(name     ? name     : ""),
@@ -173,6 +191,7 @@ void log_jni_lookup(
         const char* class_name,
         const char* caller) {
     if (!goGetLoggingReady()) return;
+    if (!config_is_allowed(lookup_type)) return;
     goJNILookupCallback(
         (char*)lookup_type,
         (char*)name,
@@ -195,6 +214,7 @@ void log_jni_register_natives(
         int n_methods,
         const char* caller) {
     if (!goGetLoggingReady()) return;
+    if (!config_is_allowed("RegisterNatives")) return;
 
     char buf[2048];
     char* p = buf;
@@ -229,6 +249,7 @@ void log_jni_field_access(
         const char* value_extra,
         const char* caller) {
     if (!goGetLoggingReady()) return;
+    if (!config_is_allowed(name)) return;
     goJNIFieldCallback(
         offset,
         (char*)(name           ? name           : ""),

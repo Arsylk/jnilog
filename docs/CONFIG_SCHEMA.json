@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "JNILog Configuration",
+  "description": "Configuration for the libjnilog.so JNI logging payload.",
+  "type": "object",
+  "properties": {
+    "functions": {
+      "description": "Whitelist: JNI function names to log. Empty = log all functions.",
+      "type": "array",
+      "items": {"type": "string"},
+      "default": []
+    },
+    "categories": {
+      "description": "Category shorthand — expands to function names. Merged into whitelist. Empty = none.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["methods", "fields", "exceptions", "arrays", "strings", "refs", "lookups"]
+      },
+      "default": []
+    },
+    "exclude": {
+      "description": "Blacklist rules. Always applied regardless of whitelist.",
+      "type": "object",
+      "properties": {
+        "functions": {
+          "description": "JNI function names to suppress. Expands via categories below.",
+          "type": "array",
+          "items": {"type": "string"},
+          "default": []
+        },
+        "categories": {
+          "description": "Category shorthand for exclusion. Expands to function names.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["methods", "fields", "exceptions", "arrays", "strings", "refs", "lookups"]
+          },
+          "default": []
+        },
+        "regex": {
+          "description": "Regex patterns matched against call keys (fn|class::method(args): ret).",
+          "type": "array",
+          "items": {"type": "string"},
+          "default": []
+        }
+      },
+      "default": {}
+    },
+    "array_items": {
+      "description": "Maximum array elements to display before +N more truncation.",
+      "type": "integer",
+      "minimum": 0,
+      "default": 16
+    },
+    "stack_depth": {
+      "description": "Native stack frames to unwind per call. 0 = off.",
+      "type": "integer",
+      "minimum": 0,
+      "default": 0
+    }
+  }
+}

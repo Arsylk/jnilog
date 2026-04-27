@@ -1,5 +1,6 @@
 # Build artifacts
 build/
+dist/
 
 # xmake artifacts
 .xmake/
@@ -24,3 +25,7 @@ Thumbs.db
 *.a
 *.test
 # Note: build/ is already ignored, but this catches stray artifacts in src/
+
+# Log files from test sessions
+log_*.txt
+*.log

@@ -400,8 +400,45 @@ static jint hooked_RegisterNatives(JNIEnv *env, jclass clazz,
 #define INSTALL_GET_ARRAY_ELEMENTS_HOOKS(Name, CType, RetKind, UnionF) \
   g_hooked_jni_table.Get##Name##ArrayElements = hooked_Get##Name##ArrayElements;
 
+/* ============================================================================
+ * Release*ArrayElements — paired with Get*ArrayElements, closes the lifecycle.
+ * Log mode (0=copy+free, JNI_COMMIT=1, JNI_ABORT=2) for leak detection.
+ * ============================================================================ */
+#define DEFINE_RELEASE_ARRAY_ELEMENTS_HOOKS(Name, CType, ...)                  \
+  void hooked_Release##Name##ArrayElements(JNIEnv *env, CType##Array array,    \
+                                           CType *elems, jint mode) {          \
+    void *caller = __builtin_return_address(0);                                 \
+    if (is_reentrant_call()) {                                                  \
+      if (g_original_jni_table && g_original_jni_table->Release##Name##ArrayElements) \
+        g_original_jni_table->Release##Name##ArrayElements(env, array, elems, mode); \
+      return;                                                                   \
+    }                                                                           \
+    int should_log = should_log_from_caller(env, caller);                       \
+    if (g_original_jni_table && g_original_jni_table->Release##Name##ArrayElements) \
+      g_original_jni_table->Release##Name##ArrayElements(env, array, elems, mode); \
+    if (should_log) {                                                           \
+      set_reentrant_call(1);                                                    \
+      char cs[192]; address_of_r(caller, cs, sizeof(cs));                      \
+      char enc[64];                                                             \
+      const char *modeStr = (mode == JNI_COMMIT) ? "commit"                    \
+                          : (mode == JNI_ABORT)  ? "abort"                     \
+                          :                       "free";                      \
+      snprintf(enc, sizeof(enc), "I\x01%d\x02s\x01%s\x02", (int)mode, modeStr);\
+      log_jni_call(JNI_SLOT(Release##Name##ArrayElements),                     \
+                   "Release" #Name "ArrayElements",                             \
+                   WIRE_KIND_NULL, "", "", "",                                  \
+                   "Release" #Name "ArrayElements", enc, 0, cs);                \
+      LOG_VOID_RET(Release##Name##ArrayElements, "Release" #Name "ArrayElements"); \
+      set_reentrant_call(0);                                                    \
+    }                                                                           \
+  }
+
+#define INSTALL_RELEASE_ARRAY_ELEMENTS_HOOKS(Name, CType, ...) \
+  g_hooked_jni_table.Release##Name##ArrayElements = hooked_Release##Name##ArrayElements;
+
 JNI_PRIMITIVE_ARRAY_TYPES(DEFINE_NEW_ARRAY_HOOKS)
 JNI_PRIMITIVE_ARRAY_TYPES(DEFINE_GET_ARRAY_ELEMENTS_HOOKS)
+JNI_PRIMITIVE_ARRAY_TYPES(DEFINE_RELEASE_ARRAY_ELEMENTS_HOOKS)
 
 static jobjectArray hooked_NewObjectArray(JNIEnv *env, jsize length,
                                            jclass elementClass, jobject initialElement) {
@@ -459,6 +496,69 @@ static jobject hooked_GetObjectArrayElement(JNIEnv *env, jobjectArray array, jsi
     set_reentrant_call(0);
   }
   return result;
+}
+
+/* ============================================================================
+ * SetObjectArrayElement — Write a reference into an object array.
+ * Mirrors GetObjectArrayElement: logs array repr, index, and the value being set.
+ * ============================================================================ */
+static void hooked_SetObjectArrayElement(JNIEnv *env, jobjectArray array,
+                                          jsize index, jobject value) {
+  void *caller = __builtin_return_address(0);
+  if (is_reentrant_call()) {
+    if (g_original_jni_table && g_original_jni_table->SetObjectArrayElement)
+      g_original_jni_table->SetObjectArrayElement(env, array, index, value);
+    return;
+  }
+  int should_log = should_log_from_caller(env, caller);
+  if (g_original_jni_table && g_original_jni_table->SetObjectArrayElement)
+    g_original_jni_table->SetObjectArrayElement(env, array, index, value);
+  if (should_log) {
+    set_reentrant_call(1);
+    char cs[192]; address_of_r(caller, cs, sizeof(cs));
+    char *arr = vis_encode_array_items(env, array, 'L');
+    /* Encode array as '[' arg, index as 'I' arg, then value */
+    size_t _alen = arr ? strlen(arr) : 0;
+    char *enc = (char*)malloc(_alen + 256);
+    enc[0] = '['; enc[1] = '\x01';
+    if (arr && _alen > 0) memcpy(enc + 2, arr, _alen);
+    int _pos = 2 + (int)_alen;
+    enc[_pos++] = '\x02';
+    _pos += snprintf(enc + _pos, 24, "I\x01%d\x02", (int)index);
+    /* Encode the value being set — each record is self-delimiting via \x02 */
+    if (!value) {
+      _pos += snprintf(enc + _pos, 8, "p\x01" "null\x02");
+    } else if (vis_is_string(env, value)) {
+      char *sv = vis_string_value_raw(env, value);
+      _pos += snprintf(enc + _pos, _alen + 256 - _pos,
+                       "s\x01%.200s\x02", sv ? sv : "");
+      free(sv);
+    } else if (vis_is_class(env, value)) {
+      char *cn = vis_class_name(env, value);
+      _pos += snprintf(enc + _pos, _alen + 256 - _pos,
+                       "c\x01%.200s\x02", cn ? cn : "");
+      free(cn);
+    } else {
+      char *cn = vis_object_class_name(env, value);
+      char *ts = vis_object_tostring(env, value);
+      _pos += snprintf(enc + _pos, _alen + 256 - _pos,
+                       "L\x01%.200s", cn ? cn : "");
+      free(cn);
+      if (ts) {
+        enc[_pos++] = '\x03';
+        _pos += snprintf(enc + _pos, _alen + 256 - _pos, "%.200s", ts);
+        free(ts);
+      }
+      enc[_pos++] = '\x02';
+    }
+    enc[_pos] = '\0';
+    free(arr);
+    log_jni_call(JNI_SLOT(SetObjectArrayElement), "SetObjectArrayElement",
+                 WIRE_KIND_NULL, "", "", "", "SetObjectArrayElement", enc, 0, cs);
+    free(enc);
+    LOG_VOID_RET(SetObjectArrayElement, "SetObjectArrayElement");
+    set_reentrant_call(0);
+  }
 }
 
 static jsize hooked_GetArrayLength(JNIEnv *env, jarray array) {
@@ -893,8 +993,20 @@ jthrowable hooked_ExceptionOccurred(JNIEnv *env) {
   void *caller = __builtin_return_address(0);
   jthrowable res = g_original_jni_table->ExceptionOccurred(env);
   if (res && !is_reentrant_call() && should_log_from_caller(env, caller)) {
-    LOG_VOID_CALL(ExceptionOccurred, "ExceptionOccurred", caller);
-    LOG_OBJ_RET(env, ExceptionOccurred, "ExceptionOccurred", res);
+    set_reentrant_call(1);
+    char cs[192]; address_of_r(caller, cs, sizeof(cs));
+    /* The exception is still pending — JNI calls (GetObjectClass, toString)
+     * will fail while it's live.  Save it, clear it temporarily, resolve
+     * the display strings, then re-throw so the caller gets it back. */
+    g_original_jni_table->ExceptionClear(env);
+
+    log_jni_call(JNI_SLOT(ExceptionOccurred), "ExceptionOccurred",
+                 WIRE_KIND_NULL, "", "", "", "ExceptionOccurred", "", 0, cs);
+    _log_obj_ret(JNI_SLOT(ExceptionOccurred), "ExceptionOccurred", env, res);
+
+    /* Re-throw — ExceptionOccurred is a peek, not a clear/consume */
+    g_original_jni_table->Throw(env, res);
+    set_reentrant_call(0);
   }
   return res;
 }
@@ -908,9 +1020,36 @@ void hooked_ExceptionDescribe(JNIEnv *env) {
 }
 void hooked_ExceptionClear(JNIEnv *env) {
   void *caller = __builtin_return_address(0);
-  if (!is_reentrant_call() && should_log_from_caller(env, caller)) {
-    LOG_VOID_CALL(ExceptionClear, "ExceptionClear", caller);
+  int should_log = !is_reentrant_call() && should_log_from_caller(env, caller);
+  if (should_log) {
+    /* Before clearing, peek at what exception exists so we can show it. */
+    set_reentrant_call(1);
+    char cs[192]; address_of_r(caller, cs, sizeof(cs));
+    jthrowable exc = g_original_jni_table->ExceptionOccurred(env);
+    if (exc) {
+      char *cn = vis_object_class_name(env, exc);
+      char *ts = vis_object_tostring(env, exc);
+      char enc[1024];
+      int pos = 0;
+      if (vis_is_string(env, exc)) {
+        char *sv = vis_string_value_raw(env, exc);
+        pos = snprintf(enc, sizeof(enc), "s\x01%.400s", sv ? sv : "");
+        free(sv);
+      } else {
+        pos = snprintf(enc, sizeof(enc), "L\x01%.400s", cn ? cn : "");
+      }
+      if (ts) { enc[pos++] = '\x03'; snprintf(enc + pos, sizeof(enc) - pos, "%.400s", ts); }
+      enc[sizeof(enc)-1] = '\0';
+      free(cn); free(ts);
+      log_jni_call(JNI_SLOT(ExceptionClear), "ExceptionClear",
+                   WIRE_KIND_NULL, "", "", "", "ExceptionClear", enc, 0, cs);
+      g_original_jni_table->DeleteLocalRef(env, exc);
+    } else {
+      log_jni_call(JNI_SLOT(ExceptionClear), "ExceptionClear",
+                   WIRE_KIND_NULL, "", "", "", "ExceptionClear", "", 0, cs);
+    }
     LOG_VOID_RET(ExceptionClear, "ExceptionClear");
+    set_reentrant_call(0);
   }
   g_original_jni_table->ExceptionClear(env);
 }
@@ -925,7 +1064,28 @@ void hooked_FatalError(JNIEnv *env, const char *msg) {
   g_original_jni_table->FatalError(env, msg);
 }
 jboolean hooked_ExceptionCheck(JNIEnv *env) {
-  return g_original_jni_table->ExceptionCheck(env);
+  void *caller = __builtin_return_address(0);
+  jboolean res = g_original_jni_table->ExceptionCheck(env);
+  if (!is_reentrant_call() && should_log_from_caller(env, caller)) {
+    set_reentrant_call(1);
+    char cs[192]; address_of_r(caller, cs, sizeof(cs));
+    if (res) {
+      /* Encode 'true' as call arg, then resolve the exception object as return value. */
+      char enc[32];
+      snprintf(enc, sizeof(enc), "Z\x01%d\x02", (int)res);
+      log_jni_call(JNI_SLOT(ExceptionCheck), "ExceptionCheck",
+                   WIRE_KIND_NULL, "", "", "", "ExceptionCheck", enc, 0, cs);
+      jthrowable exc = g_original_jni_table->ExceptionOccurred(env);
+      _log_obj_ret(JNI_SLOT(ExceptionCheck), "ExceptionCheck", env, exc);
+      if (exc) g_original_jni_table->DeleteLocalRef(env, exc);
+    } else {
+      log_jni_call(JNI_SLOT(ExceptionCheck), "ExceptionCheck",
+                   WIRE_KIND_NULL, "", "", "", "ExceptionCheck", "", 0, cs);
+      LOG_BOOL_RET(ExceptionCheck, "ExceptionCheck", res);
+    }
+    set_reentrant_call(0);
+  }
+  return res;
 }
 
 /* ============================================================================
@@ -1198,8 +1358,10 @@ static void build_hooked_table(void) {
   JNI_FIELD_TYPES(INSTALL_STATIC_FIELD_SET_HOOKS)
   JNI_PRIMITIVE_ARRAY_TYPES(INSTALL_NEW_ARRAY_HOOKS)
   JNI_PRIMITIVE_ARRAY_TYPES(INSTALL_GET_ARRAY_ELEMENTS_HOOKS)
+  JNI_PRIMITIVE_ARRAY_TYPES(INSTALL_RELEASE_ARRAY_ELEMENTS_HOOKS)
   g_hooked_jni_table.NewObjectArray         = hooked_NewObjectArray;
   g_hooked_jni_table.GetObjectArrayElement  = hooked_GetObjectArrayElement;
+  g_hooked_jni_table.SetObjectArrayElement  = hooked_SetObjectArrayElement;
   g_hooked_jni_table.GetArrayLength         = hooked_GetArrayLength;
   g_hooked_jni_table.GetPrimitiveArrayCritical    = hooked_GetPrimitiveArrayCritical;
   g_hooked_jni_table.ReleasePrimitiveArrayCritical = hooked_ReleasePrimitiveArrayCritical;

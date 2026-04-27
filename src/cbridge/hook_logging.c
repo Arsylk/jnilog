@@ -280,7 +280,7 @@ void emit_field_access_begin(call_target_kind_t target_kind, const char *name,
 
     set_reentrant_call(1);
     int recv_kind = (target_kind == CALL_TARGET_STATIC)
-                        ? WIRE_KIND_NULL
+                        ? ctx->receiver_kind  /* pass class as receiver for static */
                         : ctx->receiver_kind;
     log_jni_field_access(
         slot, name,

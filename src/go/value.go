@@ -227,6 +227,10 @@ func buildJNIValue(kind JNIKind, raw string) JNIValue {
 	case KindClass:
 		v.Str = normalizeDots(raw)
 	case KindObject:
+		// Null sentinel from vis_encode_array_items('L'): literal "null"
+		if raw == "null" {
+			return NullValue
+		}
 		// raw = "class/Name\x03toStringValue" or just "class/Name"
 		if idx := strings.IndexByte(raw, '\x03'); idx >= 0 {
 			v.Str = normalizeDots(raw[:idx])

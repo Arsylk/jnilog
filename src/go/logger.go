@@ -450,6 +450,10 @@ func (f lineFormatter) formatFieldName(name string) string {
 	if name == "" {
 		return f.colorize(ansiRed, "<unknown>")
 	}
+	if name == "?" {
+		// Could not resolve field name — ART symbol missing or cache miss
+		return f.colorize(ansiRed, "<unresolved>")
+	}
 	return f.colorize(ansiMagenta, name)
 }
 
@@ -508,6 +512,11 @@ func (f lineFormatter) formatType(name string) string {
 
 // emitCallFull renders a complete method call + return as one log line.
 func emitCallFull(offset int, frame *callFrame, result JNIValue) {
+	// Gate 3: regex blacklist (skip before any formatting work)
+	if configSignatureBlacklisted(frame.callKey()) {
+		return
+	}
+
 	methodTag := f.dim("[" + frame.jniName + "]")
 
 	var receiverStr string
@@ -524,57 +533,88 @@ func emitCallFull(offset int, frame *callFrame, result JNIValue) {
 			f.colorize(ansiGray, ", len=") + f.formatJNIValue(frame.args[1]) +
 			f.colorize(ansiGray, ", buf=") + f.formatJNIValue(frame.args[2]) +
 			f.colorize(ansiBlue, ")")
+	} else if frame.jniName == "SetObjectArrayElement" && len(frame.args) >= 3 {
+		// SetObjectArrayElement(array, index, value)
+		prettyCall = f.colorize(ansiBlue, "(") +
+			f.colorize(ansiGray, "array=") + f.formatJNIValue(frame.args[0]) +
+			f.colorize(ansiGray, ", index=") + f.formatJNIValue(frame.args[1]) +
+			f.colorize(ansiGray, ", value=") + f.formatJNIValue(frame.args[2]) +
+			f.colorize(ansiBlue, ")")
+	} else if frame.jniName == "GetObjectArrayElement" && len(frame.args) >= 2 {
+		// GetObjectArrayElement(array, index)
+		prettyCall = f.colorize(ansiBlue, "(") +
+			f.colorize(ansiGray, "array=") + f.formatJNIValue(frame.args[0]) +
+			f.colorize(ansiGray, ", index=") + f.formatJNIValue(frame.args[1]) +
+			f.colorize(ansiBlue, ")")
 	} else {
 		prettyCall = f.formatPrettyCallTyped(frame.className, frame.methodName, frame.args)
 	}
 
 	resultStr := f.formatJNIValue(result)
 
-	writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s %s %s %s",
-		f.formatOffset(offset),
-		methodTag,
-		receiverStr,
-		prettyCall,
-		f.formatArrow(),
-		resultStr,
-		f.formatAddress(frame.caller),
-	))
+	// Void-returning calls (Release*, Delete*, SetObjectArrayElement,
+	// CallVoidMethod, ExceptionClear, etc.) don't need "→ void" —
+	// the side effect is the point, not the return value.
+	if result.Kind != KindVoid {
+		writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s %s %s %s",
+			f.formatOffset(offset),
+			methodTag,
+			receiverStr,
+			prettyCall,
+			f.formatArrow(),
+			resultStr,
+			f.formatAddress(frame.caller),
+		))
+	} else {
+		writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s %s",
+			f.formatOffset(offset),
+			methodTag,
+			receiverStr,
+			prettyCall,
+			f.formatAddress(frame.caller),
+		))
+	}
 }
 
 // emitJNILookup renders GetMethodID / FindClass / GetFieldID events.
 func emitJNILookup(lookupType string, name string, sig string, classHandle uintptr, className string, caller string) {
+	// Gate 3: regex blacklist
+	key := lookupType + "|" + className
+	if configSignatureBlacklisted(key) {
+		return
+	}
+
 	methodTag := f.dim("[" + lookupType + "]")
 
 	var prettyTarget string
 	var returnVal string
 	if lookupType == "FindClass" {
-		dotName := strings.ReplaceAll(name, "/", ".")
-		prettyTarget = f.colorize(ansiLavender, `"`+dotName+`"`)
+		// Argument is the raw JNI descriptor with slashes ("android/content/pm/...")
+		prettyTarget = f.colorize(ansiLavender, `"`+name+`"`)
 		if classHandle == 0 {
 			returnVal = f.colorize(ansiMagenta, "null")
 		} else {
+			// Return is the resolved jclass — display as dotted Java name
+			dotName := strings.ReplaceAll(name, "/", ".")
 			returnVal = f.formatClassName(dotName)
 		}
 	} else {
 		isField := strings.Contains(lookupType, "Field")
 		prettyClass := f.formatClassName(strings.ReplaceAll(className, "/", "."))
 
-		var memberName string
+		parsedSig := parseJNISignature(sig)
+
 		if isField {
-			memberName = f.formatFieldName(name)
-		} else {
-			memberName = f.colorize(ansiGreen, name)
-		}
-
-		prettyTarget = prettyClass + f.colorize(ansiBlue, "::") + memberName
-
-		if strings.Contains(lookupType, "Method") || isField {
-			parsedSig := parseJNISignature(sig)
-			if isField && parsedSig != "" {
-				prettyTarget += " " + parsedSig
-			} else {
-				prettyTarget += parsedSig
+			// Field: <class>.<field>: <type>  (dot separator, colon+space before type)
+			memberName := f.formatFieldName(name)
+			prettyTarget = prettyClass + f.colorize(ansiGray, ".") + memberName
+			if parsedSig != "" {
+				prettyTarget += f.colorize(ansiGray, ": ") + parsedSig
 			}
+		} else {
+			// Method: <class>::<method>(<args>): <ret>
+			memberName := f.colorize(ansiGreen, name)
+			prettyTarget = prettyClass + f.colorize(ansiBlue, "::") + memberName + parsedSig
 		}
 		returnVal = f.formatMethodFieldID(classHandle)
 	}
@@ -636,9 +676,36 @@ func emitRegisterNatives(clazz uintptr, className string, methods string, caller
 func emitFieldAccess(offset int, name string, receiver JNIValue, fieldName string, value JNIValue, caller string) {
 	methodTag := f.dim("[" + name + "]")
 
-	var receiverStr string
-	if receiver.Kind != KindNull {
-		receiverStr = f.colorize(ansiGray, "this=") + f.formatJNIValue(receiver)
+	isStatic := strings.Contains(name, "Static")
+
+	// Build the left-hand side: class qualifier + field name + type
+	var targetStr string
+	// If the field name is unresolved ("?" from C when art_get_field_name failed
+	// and no cache hit), skip the type annotation — "?:" would look confusing.
+	fieldKnown := fieldName != "?"
+
+	if isStatic {
+		// Static: <class>.<field>[: <type>]
+		className := receiver.Str
+		if className == "" {
+			className = "<unknown>"
+		}
+		targetStr = f.formatClassName(className) +
+			f.colorize(ansiGray, ".") +
+			f.formatFieldName(fieldName)
+		if fieldKnown {
+			targetStr += f.colorize(ansiGray, ": ") + f.formatFieldType(value)
+		}
+	} else {
+		// Instance: this=<receiver> <field>[: <type>]
+		var receiverStr string
+		if receiver.Kind != KindNull {
+			receiverStr = f.colorize(ansiGray, "this=") + f.formatJNIValue(receiver)
+		}
+		targetStr = receiverStr + " " + f.formatFieldName(fieldName)
+		if fieldKnown {
+			targetStr += f.colorize(ansiGray, ": ") + f.formatFieldType(value)
+		}
 	}
 
 	arrow := f.formatArrow()
@@ -646,15 +713,72 @@ func emitFieldAccess(offset int, name string, receiver JNIValue, fieldName strin
 		arrow = f.formatSetArrow()
 	}
 
-	writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s %s %s %s",
+	// Gate 3: regex blacklist (plain-text key, no colors)
+	if fieldKnown && isStatic {
+		if configSignatureBlacklisted(callKeyForFieldTarget(name, receiver.Str, fieldName, value)) {
+			return
+		}
+	}
+
+	writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s %s %s",
 		f.formatOffset(offset),
 		methodTag,
-		receiverStr,
-		f.formatFieldName(fieldName),
+		strings.TrimSpace(targetStr),
 		arrow,
 		f.formatJNIValue(value),
 		f.formatAddress(caller),
 	))
+}
+
+// formatFieldType renders the human-readable type name of a JNIValue for field display.
+// Class-like types are colored, primitives are plain.
+func (f lineFormatter) formatFieldType(v JNIValue) string {
+	switch v.Kind {
+	case KindBoolean:
+		return f.colorize(ansiMagenta, "boolean")
+	case KindByte:
+		return f.colorize(ansiMagenta, "byte")
+	case KindChar:
+		return f.colorize(ansiMagenta, "char")
+	case KindShort:
+		return f.colorize(ansiMagenta, "short")
+	case KindInt:
+		return f.colorize(ansiMagenta, "int")
+	case KindLong:
+		return f.colorize(ansiMagenta, "long")
+	case KindFloat:
+		return f.colorize(ansiMagenta, "float")
+	case KindDouble:
+		return f.colorize(ansiMagenta, "double")
+	case KindString:
+		return f.formatClassName("java.lang.String")
+	case KindClass:
+		return f.formatClassName("java.lang.Class")
+	case KindObject:
+		if v.Str != "" {
+			return f.formatClassName(v.Str)
+		}
+		return f.colorize(ansiGray, "?")
+	case KindArray:
+		return f.formatArrayType(v)
+	case KindNull:
+		// Null value — no type info available at runtime
+		return f.colorize(ansiGray, "?")
+	default:
+		return f.colorize(ansiGray, "?")
+	}
+}
+
+// formatArrayType reconstructs a Java array type name (e.g. "byte[]") from an array JNIValue.
+func (f lineFormatter) formatArrayType(v JNIValue) string {
+	if len(v.Items) == 0 {
+		return f.colorize(ansiMagenta, "?")
+	}
+	// Reconstruct by wrapping the element type name with []
+	// Use a placeholder value with the same kind to get its formatted name
+	elemValue := v.Items[0]
+	elemName := f.formatFieldType(elemValue)
+	return elemName + f.colorize(ansiMagenta, "[]")
 }
 
 // emitInfo logs a plain informational message.

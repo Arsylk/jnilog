@@ -7,7 +7,6 @@ set_plat("android")
 set_arch("arm64-v8a")
 
 -- Include directories
-add_includedirs("src/shared")
 add_includedirs("src/cbridge")
 
 -- C flags
