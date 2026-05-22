@@ -110,8 +110,48 @@ char* vis_object_class_name(JNIEnv* env, void* obj_ptr) {
     return res;
 }
 
+/* Classes whose toString() has destructive side effects (consumes the object).
+ * We skip toString() for these and return NULL so the formatter uses class-name-only rendering. */
+static const char* const vis_tostring_blocklist[] = {
+    "com.facebook.react.bridge.WritableNativeMap",
+    "com.facebook.react.bridge.ReadableNativeMap",
+    "com.facebook.react.bridge.WritableNativeArray",
+    "com.facebook.react.bridge.ReadableNativeArray",
+    "com.facebook.react.bridge.NativeMap",
+    "com.facebook.react.bridge.NativeArray",
+    NULL
+};
+
+static int vis_is_tostring_blocked(const char* class_name) {
+    if (!class_name) return 0;
+    for (int i = 0; vis_tostring_blocklist[i] != NULL; i++) {
+        if (strcmp(class_name, vis_tostring_blocklist[i]) == 0) return 1;
+    }
+    return 0;
+}
+
 char* vis_object_tostring(JNIEnv* env, void* obj_ptr) {
+    return vis_object_tostring_safe(env, obj_ptr, NULL);
+}
+
+/* vis_object_tostring_safe — like vis_object_tostring but accepts a pre-resolved
+ * class name to check against the blocklist. If class_name is NULL, resolves it. */
+char* vis_object_tostring_safe(JNIEnv* env, void* obj_ptr, const char* class_name) {
     if (obj_ptr == NULL || !vis_safe_to_call(env)) return NULL;
+
+    /* Check blocklist using provided or resolved class name */
+    char* resolved_name = NULL;
+    const char* check_name = class_name;
+    if (!check_name) {
+        resolved_name = vis_object_class_name(env, obj_ptr);
+        check_name = resolved_name;
+    }
+    if (check_name && vis_is_tostring_blocked(check_name)) {
+        free(resolved_name);
+        return NULL;
+    }
+    free(resolved_name);
+
     set_reentrant_call(1);
     jclass c = g_original_jni_table->GetObjectClass(env, (jobject)obj_ptr);
     if (!c) { set_reentrant_call(0); return NULL; }
@@ -119,6 +159,14 @@ char* vis_object_tostring(JNIEnv* env, void* obj_ptr) {
     char* res = NULL;
     if (mid) {
         jstring s = (jstring)g_original_jni_table->CallObjectMethod(env, (jobject)obj_ptr, mid);
+        if (g_original_jni_table->ExceptionCheck(env)) {
+            /* toString() threw — clear and return NULL to avoid propagation (Req 8.3) */
+            g_original_jni_table->ExceptionClear(env);
+            if (s) g_original_jni_table->DeleteLocalRef(env, s);
+            g_original_jni_table->DeleteLocalRef(env, c);
+            set_reentrant_call(0);
+            return NULL;
+        }
         if (s) {
             const char* ch = g_original_jni_table->GetStringUTFChars(env, s, NULL);
             if (ch) { res = strdup(ch); g_original_jni_table->ReleaseStringUTFChars(env, s, ch); }
@@ -317,7 +365,7 @@ char* vis_encode_array_items(JNIEnv* env, void* arr, char itemSigChar) {
                 else buf = VEA_LIT(buf, &len, &cap, "");
             } else {
                 char *cn = vis_object_class_name(env, elem);
-                char *ts = vis_object_tostring(env, elem);
+                char *ts = vis_object_tostring_safe(env, elem, cn);
                 if (cn) { buf = vea_append(buf, &len, &cap, cn, strlen(cn)); free(cn); }
                 if (ts) {
                     VEA_CH(buf, &len, &cap, '\x03');
@@ -516,7 +564,7 @@ char* vis_encode_typed_args(JNIEnv *env, const char *sig, uintptr_t *extracted, 
                 if (cn) { buf = vea_append(buf, &len, &cap, cn, strlen(cn)); free(cn); }
             } else {
                 char *cn = vis_object_class_name(env, obj);
-                char *ts = vis_object_tostring(env, obj);
+                char *ts = vis_object_tostring_safe(env, obj, cn);
                 if (cn) buf = vea_append(buf, &len, &cap, cn, strlen(cn));
                 if (ts) {
                     VEA_CH(buf, &len, &cap, '\x03');

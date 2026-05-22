@@ -164,6 +164,136 @@ void log_jni_field_access(
     const char* value_extra,
     const char* caller);
 
+/* ============================================================================
+ * method_log_ctx_t — captures all per-call data in typed form.
+ *
+ * receiver_kind / receiver_str / receiver_extra carry the typed receiver
+ * (WIRE_KIND_NULL for static calls).
+ * encoded_args is the vis_encode_typed_args() output for Go's decodeArgs().
+ * ============================================================================ */
+typedef struct {
+    int should_log;
+    int logging_ready;
+    int receiver_kind;        /* wire_kind_t cast to int */
+    const char *sig;          /* JNI descriptor string, from cache */
+    const char *method_name;  /* short name, from cache */
+    const char *clazz_name;   /* declaring class, from cache */
+    char caller_str[192];
+    char *receiver_str;       /* heap: class name or string content */
+    char *receiver_extra;     /* heap: toString() for KindObject */
+    char *encoded_args;       /* heap: vis_encode_typed_args() output */
+} method_log_ctx_t;
+
+/* ============================================================================
+ * field_log_ctx_t — captures per-field-access data in typed form.
+ *
+ * receiver_kind / receiver_str / receiver_extra carry the typed receiver
+ * (WIRE_KIND_CLASS for static fields, WIRE_KIND_OBJECT for instance fields).
+ * clazz_name is the declaring class from the field ID cache.
+ * ============================================================================ */
+typedef struct {
+    int should_log;
+    int logging_ready;
+    int receiver_kind;        /* wire_kind_t cast to int */
+    const char *sig;          /* field type descriptor, from cache */
+    const char *field_name;   /* field name, from cache */
+    const char *clazz_name;   /* declaring class, from cache */
+    char caller_str[192];
+    char *receiver_str;       /* heap: class name */
+    char *receiver_extra;     /* heap: toString() */
+} field_log_ctx_t;
+
+/* ============================================================================
+ * Cgo export function signatures — Go callbacks invoked from C hooks.
+ *
+ * These are implemented in Go (src/go/) and exported via //export directives.
+ * The C hook layer calls these to forward typed JNI event data to Go.
+ *
+ * When building with cgo, _cgo_export.h provides the canonical declarations.
+ * These extern declarations serve as forward references for standalone C
+ * compilation (xmake) or for IDE tooling that doesn't process cgo headers.
+ * ============================================================================ */
+#ifndef _CGO_EXPORT_H_
+extern void goJNICallCallback(
+    int offset,
+    char* jni_name,
+    int receiver_kind,
+    char* receiver_str,
+    char* receiver_extra,
+    char* class_name,
+    char* method_name,
+    char* encoded_args,
+    uintptr_t mid,
+    char* caller);
+
+extern void goJNIReturnCallback(
+    int offset,
+    char* name,
+    int ret_kind,
+    uintptr_t ret_raw,
+    char* ret_str,
+    char* ret_extra);
+
+extern void goJNILookupCallback(
+    char* lookup_type,
+    char* name,
+    char* sig,
+    uintptr_t clazz,
+    char* class_name,
+    char* caller);
+
+extern void goJNIRegisterNativesCallback(
+    uintptr_t clazz,
+    char* class_name,
+    char* methods,
+    char* caller);
+
+extern void goJNIFieldCallback(
+    int offset,
+    char* name,
+    int receiver_kind,
+    char* receiver_str,
+    char* receiver_extra,
+    char* field_name,
+    int value_kind,
+    uintptr_t value_raw,
+    char* value_str,
+    char* value_extra,
+    char* caller);
+
+/* ============================================================================
+ * Config query function signatures — Go cgo exports for C-side filter cache.
+ *
+ * These are called from C hook entry points to implement Gate 1 (blacklist)
+ * and Gate 2 (whitelist) filtering without building full wire data.
+ * ============================================================================ */
+extern int config_function_blacklisted(char* name);
+extern int config_function_enabled(char* name);
+extern int config_array_max_items(void);
+extern int config_stack_depth(void);
+
+/* ============================================================================
+ * Logging readiness — Go-side flag queried by C hooks.
+ * ============================================================================ */
+extern void goSetLoggingReady(int ready);
+extern int  goGetLoggingReady(void);
+
+/* ============================================================================
+ * Go bridge lifecycle callbacks.
+ * ============================================================================ */
+extern void goBridgeInit(void);
+extern void goBridgeCleanup(void);
+
+/* ============================================================================
+ * Go native logging helpers.
+ * ============================================================================ */
+extern void goLogNative(int priority, char* message);
+extern void goLogNativeInfo(char* message);
+extern void goLogNativeWarn(char* message);
+extern void goLogNativeError(char* message);
+extern void goLogCallback(char* message);
+#endif /* _CGO_EXPORT_H_ */
+
 /* Pure C range tracking (rangeset.c) */
 void c_init_range_tracking(void);
 const char* art_get_field_name(void* field_id);
@@ -174,6 +304,8 @@ int c_is_system_lib_path(const char* path);
 int c_add_exec_range(uintptr_t base, uintptr_t size);
 int c_is_in_exec_range(uintptr_t addr);
 int c_has_exec_ranges(void);
+int c_should_try_seed(void);
+void c_reset_seed_attempted(void);
 int c_seed_exec_ranges_from_maps(void);
 
 #ifdef __cplusplus

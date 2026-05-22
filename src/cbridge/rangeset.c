@@ -45,6 +45,12 @@ static pthread_mutex_t g_range_pkg_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static struct link_map *g_last_link_map = NULL;
 
+/* Forward declaration — defined here because c_set_package_name (below) resets
+ * it.  Prevents hot-path retry storms: once we've attempted seeding and found
+ * nothing, we don't retry on every JNI call.  Reset when something changes
+ * (new library loaded via dlopen, package name set). */
+static volatile int g_seed_attempted = 0;
+
 void c_set_package_name(const char *name) {
   pthread_mutex_lock(&g_range_pkg_lock);
   if (name != NULL) {
@@ -62,6 +68,10 @@ void c_set_package_name(const char *name) {
   /* Reset the link_map cursor so the next c_seed_exec_ranges_from_maps()
    * performs a full rescan even if it already ran before the name was known. */
   g_last_link_map = NULL;
+
+  /* Reset the seed-attempted flag so the hot path will re-attempt seeding
+   * now that we have a valid package name. */
+  g_seed_attempted = 0;
 }
 
 const char *c_get_package_name(void) {
@@ -74,7 +84,8 @@ static void refresh_package_name_if_needed(void) {
 
   if (g_range_package_name[0] != '\0' &&
       strstr(g_range_package_name, "zygote") == NULL &&
-      strstr(g_range_package_name, "app_process") == NULL) {
+      strstr(g_range_package_name, "app_process") == NULL &&
+      strstr(g_range_package_name, "<pre-initialized>") == NULL) {
     pthread_mutex_unlock(&g_range_pkg_lock);
     return;
   }
@@ -125,7 +136,8 @@ static void refresh_package_name_if_needed(void) {
       buf[len] = '\0';
       if (len > 0 &&
           strstr(buf, "zygote") == NULL &&
-          strstr(buf, "app_process") == NULL) {
+          strstr(buf, "app_process") == NULL &&
+          strstr(buf, "<pre-initialized>") == NULL) {
         strncpy(g_range_package_name, buf, RANGESET_MAX_PACKAGE_NAME - 1);
         g_range_package_name[RANGESET_MAX_PACKAGE_NAME - 1] = '\0';
         g_last_link_map = NULL;
@@ -223,6 +235,21 @@ int c_is_in_exec_range(uintptr_t addr) {
 
 int c_has_exec_ranges(void) { return g_exec_range_count > 0; }
 
+/* Returns true if we should attempt seeding (either we have no ranges AND
+ * haven't tried yet, or we already have ranges).  This prevents the hot-path
+ * from calling c_seed_exec_ranges_from_maps() on every JNI hook. */
+int c_should_try_seed(void) {
+  if (g_exec_range_count > 0) return 0;  /* already have ranges */
+  if (g_seed_attempted) return 0;         /* already tried and failed */
+  return 1;
+}
+
+/* Reset the seed-attempted flag so the next should_log_from_caller will
+ * re-attempt seeding.  Called when something changes (dlopen, package name). */
+void c_reset_seed_attempted(void) {
+  g_seed_attempted = 0;
+}
+
 /* ====================================================================
  * solist scanning via link_map
  * ==================================================================== */
@@ -280,62 +307,64 @@ int c_is_system_lib_path(const char *path) {
          strstr(path, "/bionic") != NULL;
 }
 
+/* Forward declaration for /proc/self/maps fallback */
+static int c_seed_exec_ranges_from_proc_maps(void);
+
 int c_seed_exec_ranges_from_maps(void) {
   /* Refresh the package name first — the process may have been specialized
    * (renamed from zygote64 to com.termux) since the last attempt. */
   refresh_package_name_if_needed();
 
-  struct r_debug *dbg = find_r_debug();
-  if (!dbg || !dbg->r_map)
-    return 0;
-
-  struct link_map *last_map = dbg->r_map;
-  while (last_map->l_next) {
-    last_map = last_map->l_next;
-  }
-
-  /* Skip re-scan only when the link_map tail hasn't changed AND we already
-   * have a valid package name (otherwise the previous scan was a no-op). */
-  if (g_last_link_map == last_map && g_range_package_name[0] != '\0' &&
-      strstr(g_range_package_name, "zygote") == NULL &&
-      strstr(g_range_package_name, "app_process") == NULL) {
-    return 0;
-  }
-  g_last_link_map = last_map;
-
   int added = 0;
 
-  for (struct link_map *map = dbg->r_map; map; map = map->l_next) {
-    const char* lib_name = map->l_name;
-    Dl_info info;
-    if (dladdr((void*)map->l_addr, &info) && info.dli_fname != NULL && info.dli_fname[0] != '\0') {
-      lib_name = info.dli_fname;
+  struct r_debug *dbg = find_r_debug();
+  if (dbg && dbg->r_map) {
+    struct link_map *last_map = dbg->r_map;
+    while (last_map->l_next) {
+      last_map = last_map->l_next;
     }
 
-    if (lib_name == NULL || lib_name[0] == '\0') {
-      continue;
-    }
+    /* Skip re-scan only when the link_map tail hasn't changed AND we already
+     * have a valid package name (otherwise the previous scan was a no-op). */
+    int skip_link_map = (g_last_link_map == last_map && g_range_package_name[0] != '\0' &&
+        strstr(g_range_package_name, "zygote") == NULL &&
+        strstr(g_range_package_name, "app_process") == NULL &&
+        strstr(g_range_package_name, "<pre-initialized>") == NULL);
 
-    /* Exclude our own payload module by load base address */
-    Dl_info self_info;
-    if (dladdr((void*)c_seed_exec_ranges_from_maps, &self_info)) {
-      if (map->l_addr == (ElfW(Addr))self_info.dli_fbase) {
-        continue;
-      }
-    }
+    if (!skip_link_map) {
+      g_last_link_map = last_map;
 
-    /* Fallback string-based exclusion */
-    if (strstr(lib_name, "libjnilog") != NULL) {
-      continue;
-    }
+      for (struct link_map *map = dbg->r_map; map; map = map->l_next) {
+        const char* lib_name = map->l_name;
+        Dl_info info;
+        if (dladdr((void*)map->l_addr, &info) && info.dli_fname != NULL && info.dli_fname[0] != '\0') {
+          lib_name = info.dli_fname;
+        }
 
-    int has_pkg = c_path_contains_package(lib_name);
-    if (!has_pkg) {
-      continue;
-    }
+        if (lib_name == NULL || lib_name[0] == '\0') {
+          continue;
+        }
 
-    ElfW(Addr) load_bias = map->l_addr;
-    ElfW(Ehdr) *ehdr = (ElfW(Ehdr) *)load_bias;
+        /* Exclude our own payload module by load base address */
+        Dl_info self_info;
+        if (dladdr((void*)c_seed_exec_ranges_from_maps, &self_info)) {
+          if (map->l_addr == (ElfW(Addr))self_info.dli_fbase) {
+            continue;
+          }
+        }
+
+        /* Fallback string-based exclusion */
+        if (strstr(lib_name, "libjnilog") != NULL) {
+          continue;
+        }
+
+        int has_pkg = c_path_contains_package(lib_name);
+        if (!has_pkg) {
+          continue;
+        }
+
+        ElfW(Addr) load_bias = map->l_addr;
+        ElfW(Ehdr) *ehdr = (ElfW(Ehdr) *)load_bias;
 
     if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
       continue;
@@ -357,8 +386,104 @@ int c_seed_exec_ranges_from_maps(void) {
         }
       }
     }
+    } /* end for (link_map) */
+    } /* end if (!skip_link_map) */
+  } /* end if (dbg && dbg->r_map) */
+
+  /* Fallback: if link_map scan found nothing, try /proc/self/maps directly.
+   * This catches libraries in classloader namespaces (System.loadLibrary). */
+  if (!c_has_exec_ranges()) {
+    added += c_seed_exec_ranges_from_proc_maps();
+#if __has_include(<android/log.h>)
+    if (added == 0 && g_range_package_name[0] != '\0' &&
+        strstr(g_range_package_name, "zygote") == NULL) {
+      __android_log_print(ANDROID_LOG_WARN, RANGESET_LOG_TAG,
+                          "seed fallback: no ranges found for pkg '%s' (maps scan returned 0)",
+                          g_range_package_name);
+    }
+#endif
   }
 
+  /* Mark that we've attempted seeding.  If we found nothing, the hot path
+   * won't retry until something resets this flag (dlopen, set_package_name). */
+  g_seed_attempted = 1;
+
+  return added;
+}
+
+/* Fallback: scan /proc/self/maps for executable regions matching the package name.
+ * This catches libraries loaded via classloader namespaces that don't appear in
+ * the global link_map (e.g., app native libraries loaded via System.loadLibrary). */
+static int c_seed_exec_ranges_from_proc_maps(void) {
+  if (g_range_package_name[0] == '\0' ||
+      strstr(g_range_package_name, "zygote") != NULL ||
+      strstr(g_range_package_name, "app_process") != NULL ||
+      strstr(g_range_package_name, "<pre-initialized>") != NULL) {
+    return 0;
+  }
+
+  FILE *f = fopen("/proc/self/maps", "r");
+  if (!f) return 0;
+
+  int added = 0;
+  char line[512];
+
+  while (fgets(line, sizeof(line), f)) {
+    /* Parse: start-end perms offset dev inode pathname */
+    uintptr_t start, end;
+    char perms[5];
+    int n = sscanf(line, "%lx-%lx %4s", (unsigned long*)&start, (unsigned long*)&end, perms);
+    if (n < 3) continue;
+
+    /* Only executable regions */
+    if (perms[2] != 'x') continue;
+
+    /* Find the pathname (after the 5th field) */
+    char *path = NULL;
+    int spaces = 0;
+    for (char *p = line; *p; p++) {
+      if (*p == ' ' || *p == '\t') {
+        spaces++;
+        while (*(p+1) == ' ' || *(p+1) == '\t') p++;
+        if (spaces == 5) { path = p + 1; break; }
+      }
+    }
+    if (!path) continue;
+
+    /* Trim trailing newline */
+    size_t plen = strlen(path);
+    if (plen > 0 && path[plen-1] == '\n') path[plen-1] = '\0';
+    if (path[0] == '\0') continue;
+
+    /* Skip system libraries — but for /proc/self/maps we use a simpler check
+     * that doesn't exclude .odex (OAT files contain app code) */
+    if (path[0] != '/') continue;
+    if (strncmp(path, "/system/", 8) == 0 ||
+        strncmp(path, "/system_ext/", 12) == 0 ||
+        strncmp(path, "/apex/", 6) == 0 ||
+        strncmp(path, "/vendor/", 8) == 0 ||
+        strncmp(path, "/product/", 9) == 0 ||
+        strncmp(path, "/odm/", 5) == 0 ||
+        strstr(path, "/bionic") != NULL) continue;
+
+    /* Skip our own payload */
+    if (strstr(path, "libjnilog") != NULL) continue;
+
+    /* Check if path contains the package name */
+    if (strstr(path, g_range_package_name) == NULL) continue;
+
+    uintptr_t size = end - start;
+    if (size > 0 && c_add_exec_range(start, size)) {
+#if __has_include(<android/log.h>)
+      __android_log_print(ANDROID_LOG_DEBUG, RANGESET_LOG_TAG,
+                          C_DIM "range added (maps):" C_RESET " " C_LAVENDER "%lx-%lx" C_RESET " " C_YELLOW "%s" C_RESET,
+                          (unsigned long)start, (unsigned long)end, path);
+#endif
+      added++;
+    }
+  }
+
+  fclose(f);
   return added;
 }
 

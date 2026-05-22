@@ -54,7 +54,7 @@ void* android_dlopen_ext(const char* path, int flags, const android_dlextinfo* e
     void* (*real)(const char*, int, const android_dlextinfo*) = real_android_dlopen_ext;
     if (!real) return NULL;
     void* handle = real(path, flags, extinfo);
-    if (handle) c_seed_exec_ranges_from_maps();
+    if (handle) { c_reset_seed_attempted(); c_seed_exec_ranges_from_maps(); }
     return handle;
 }
 
@@ -77,6 +77,7 @@ static void* hooked_loader_dlopen(const char* filename, int flags, const void* c
     if (handle) {
         LOG_DIRECT(ANDROID_LOG_DEBUG, "__loader_dlopen(%s, 0x%x) = %p",
                    filename ? filename : "<null>", flags, handle);
+        c_reset_seed_attempted();
         c_seed_exec_ranges_from_maps();
     }
     return handle;
@@ -93,6 +94,32 @@ static void* hooked_loader_android_dlopen_ext(const char* filename, int flags,
     if (handle) {
         LOG_DIRECT(ANDROID_LOG_DEBUG, "__loader_android_dlopen_ext(%s, 0x%x) = %p",
                    filename ? filename : "<null>", flags, handle);
+
+        /* If the package name isn't resolved yet, try to extract it from the
+         * loaded library path. Paths like /data/app/~~xxx==/com.pkg.name-yyy==/...
+         * contain the package name between the second == and the dash-hash suffix. */
+        if (filename && c_get_package_name()[0] == '\0') {
+            const char *marker = strstr(filename, "/data/app/");
+            if (marker) {
+                const char *pkg_start = strstr(marker + 10, "==/");
+                if (pkg_start) {
+                    pkg_start += 3; /* skip "==/" */
+                    const char *pkg_end = strchr(pkg_start, '-');
+                    if (pkg_end && (pkg_end - pkg_start) > 3 && (pkg_end - pkg_start) < 256) {
+                        char pkg_buf[256];
+                        size_t len = (size_t)(pkg_end - pkg_start);
+                        memcpy(pkg_buf, pkg_start, len);
+                        pkg_buf[len] = '\0';
+                        /* Validate it looks like a package name (contains dots) */
+                        if (strchr(pkg_buf, '.') != NULL) {
+                            c_set_package_name(pkg_buf);
+                        }
+                    }
+                }
+            }
+        }
+
+        c_reset_seed_attempted();
         c_seed_exec_ranges_from_maps();
     }
     return handle;
@@ -320,6 +347,8 @@ static void init_once_handler(void) {
 
     LOG_DIRECT(ANDROID_LOG_INFO, "init_once_handler: starting pid=%d", getpid());
 
+    int degraded = 0;
+
     static uintptr_t libart_base = 0;
     if (!libart_base) libart_base = maps_find_lib_base("/libart.so");
     if (libart_base) {
@@ -327,6 +356,17 @@ static void init_once_handler(void) {
             elf_find_sym(libart_base, "JNI_GetCreatedJavaVMs");
         original_JNI_OnLoad = (jint (*)(JavaVM*, void*))
             elf_find_sym(libart_base, "JNI_OnLoad");
+    } else {
+        LOG_DIRECT(ANDROID_LOG_WARN,
+                   "init_once_handler: libart.so not found in /proc/self/maps, "
+                   "continuing in degraded mode (no ART symbol resolution)");
+        degraded = 1;
+    }
+    if (!degraded && !original_JNI_GetCreatedJavaVMs) {
+        LOG_DIRECT(ANDROID_LOG_WARN,
+                   "init_once_handler: JNI_GetCreatedJavaVMs not resolved from libart.so, "
+                   "continuing in degraded mode (JNI hook installation deferred)");
+        degraded = 1;
     }
     LOG_DIRECT(ANDROID_LOG_INFO, "init_once_handler: JNI_GetCreatedJavaVMs=%p JNI_OnLoad=%p",
                (void*)original_JNI_GetCreatedJavaVMs, (void*)original_JNI_OnLoad);
@@ -335,7 +375,13 @@ static void init_once_handler(void) {
     install_loader_dlopen_hook();
     try_install_hooks_from_created_vms();
 
-    LOG_DIRECT(ANDROID_LOG_INFO, "init_once_handler: initialization successful");
+    if (degraded) {
+        LOG_DIRECT(ANDROID_LOG_WARN,
+                   "init_once_handler: initialization completed in degraded mode (pid=%d)",
+                   getpid());
+    } else {
+        LOG_DIRECT(ANDROID_LOG_INFO, "init_once_handler: initialization successful");
+    }
 }
 
 /* --- JNI Hooks --- */

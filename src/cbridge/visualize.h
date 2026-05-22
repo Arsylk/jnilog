@@ -73,8 +73,13 @@ int extract_jvalue_args(const char* sig, const jvalue* args, uintptr_t* out, int
 char* vis_encode_typed_args(JNIEnv* env, const char* sig,
                              uintptr_t* extracted, int count);
 
-/* vis_object_tostring — calls obj.toString() via JNI; returns heap string. */
+/* vis_object_tostring — calls obj.toString() via JNI; returns heap string.
+ * Skips toString() for classes with known destructive side effects. */
 char* vis_object_tostring(JNIEnv* env, void* obj_ptr);
+
+/* vis_object_tostring_safe — like vis_object_tostring but accepts a pre-resolved
+ * class name to avoid redundant class name resolution for blocklist check. */
+char* vis_object_tostring_safe(JNIEnv* env, void* obj_ptr, const char* class_name);
 
 #ifdef __cplusplus
 }

@@ -1,3 +1,5 @@
+//go:build android
+
 #include "../cbridge/bridge.c"
 #include "../cbridge/hook_common.c"
 #include "../cbridge/hook_fields.c"

@@ -217,7 +217,11 @@ field_info_t lookup_field_info(jfieldID field_id) {
 
 int should_log_from_caller(JNIEnv *env, void *caller) {
   if (env == NULL || caller == NULL) return 0;
-  if (!c_has_exec_ranges()) c_seed_exec_ranges_from_maps();
+  if (c_should_try_seed()) c_seed_exec_ranges_from_maps();
+  /* Requirement 11.11/21.5: suppress all calls when no ranges are seeded
+   * (early startup, or before app libraries are loaded). Only log once
+   * we have positively identified the app's executable regions. */
+  if (!c_has_exec_ranges()) return 0;
   return c_is_in_exec_range((uintptr_t)caller);
 }
 

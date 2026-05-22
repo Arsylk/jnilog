@@ -1,3 +1,5 @@
+//go:build android
+
 package main
 
 import (
@@ -81,8 +83,19 @@ func (l *multiOutputLogger) Write(event logEvent) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	for _, sink := range l.sinks {
-		sink.Write(event)
+		l.writeSink(sink, event)
 	}
+}
+
+// writeSink delivers an event to a single sink, recovering from panics so that
+// one misbehaving sink does not prevent delivery to the remaining sinks.
+func (l *multiOutputLogger) writeSink(sink logSink, event logEvent) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "[jnilog] WARNING: sink panicked: %v\n", r)
+		}
+	}()
+	sink.Write(event)
 }
 
 type stdoutSink struct{}
@@ -474,6 +487,7 @@ func (f lineFormatter) formatMethodFieldID(id uintptr) string {
 }
 
 // formatAddress renders a caller return address in dim style.
+// Formats: library!symbol+0xNN, library!0xNN, library!symbol, raw 0xNN
 func (f lineFormatter) formatAddress(caller string) string {
 	if caller == "" {
 		return ""
@@ -482,13 +496,20 @@ func (f lineFormatter) formatAddress(caller string) string {
 	if strings.Contains(caller, "!") {
 		parts := strings.SplitN(caller, "!", 2)
 		res += f.colorize(ansiLavender, parts[0]) + f.colorize(ansiPink, "!")
-		if plus := strings.SplitN(parts[1], "+", 2); len(plus) == 2 {
-			res += f.colorize(ansiBlue, plus[0]) + f.colorize(ansiOrange, "+"+plus[1])
+		after := parts[1]
+		if plus := strings.SplitN(after, "+", 2); len(plus) == 2 {
+			// library!symbol+0xNN
+			res += f.colorize(ansiBlue, plus[0]) + f.colorize(ansiGray, "+") + f.colorize(ansiOrange, plus[1])
+		} else if strings.HasPrefix(after, "0x") || strings.HasPrefix(after, "0X") {
+			// library!0xNN (no symbol resolved)
+			res += f.colorize(ansiOrange, strings.ToLower(after))
 		} else {
-			res += f.colorize(ansiOrange, parts[1])
+			// library!symbol (offset is zero, no suffix)
+			res += f.colorize(ansiBlue, after)
 		}
-	} else if strings.HasPrefix(caller, "0x") {
-		res += f.colorize(ansiOrange, caller)
+	} else if strings.HasPrefix(caller, "0x") || strings.HasPrefix(caller, "0X") {
+		// Raw hex address (no library resolved)
+		res += f.colorize(ansiOrange, strings.ToLower(caller))
 	} else {
 		res += f.colorize(ansiDarkGray, caller)
 	}
@@ -514,6 +535,11 @@ func (f lineFormatter) formatType(name string) string {
 func emitCallFull(offset int, frame *callFrame, result JNIValue) {
 	// Gate 3: regex blacklist (skip before any formatting work)
 	if configSignatureBlacklisted(frame.callKey()) {
+		return
+	}
+
+	// Exception events get specialized formatting
+	if emitExceptionEvent(offset, frame, result) {
 		return
 	}
 
@@ -779,6 +805,118 @@ func (f lineFormatter) formatArrayType(v JNIValue) string {
 	elemValue := v.Items[0]
 	elemName := f.formatFieldType(elemValue)
 	return elemName + f.colorize(ansiMagenta, "[]")
+}
+
+// emitExceptionEvent renders exception-related JNI events with specialized formatting.
+// Handles: ExceptionCheck, ExceptionOccurred, Throw, ThrowNew, ExceptionClear, FatalError.
+// Returns true if the event was handled (caller should not emit via emitCallFull).
+func emitExceptionEvent(offset int, frame *callFrame, result JNIValue) bool {
+	switch frame.jniName {
+	case "ExceptionCheck":
+		// Render boolean result in Magenta
+		methodTag := f.dim("[" + frame.jniName + "]")
+		resultStr := f.formatJNIValue(result) // KindBoolean → "true"/"false" in Magenta
+		writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s %s",
+			f.formatOffset(offset),
+			methodTag,
+			f.formatArrow(),
+			resultStr,
+			f.formatAddress(frame.caller),
+		))
+		return true
+
+	case "ExceptionOccurred":
+		// Non-null: exception class in Cyan, message in Yellow
+		// Null: "null" in Magenta
+		methodTag := f.dim("[" + frame.jniName + "]")
+		if result.Kind == KindNull || (result.Kind == KindObject && result.Str == "") {
+			writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s %s",
+				f.formatOffset(offset),
+				methodTag,
+				f.formatArrow(),
+				f.colorize(ansiMagenta, "null"),
+				f.formatAddress(frame.caller),
+			))
+		} else {
+			// result is KindObject with Str=className, Extra=toString message
+			classStr := f.formatClassName(result.Str)
+			var msgStr string
+			if result.Extra != "" {
+				msgStr = " " + f.colorize(ansiYellow, `"`+result.Extra+`"`)
+			}
+			writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s%s %s",
+				f.formatOffset(offset),
+				methodTag,
+				f.formatArrow(),
+				classStr,
+				msgStr,
+				f.formatAddress(frame.caller),
+			))
+		}
+		return true
+
+	case "Throw", "ThrowNew":
+		// Exception class in Cyan, message in Yellow
+		methodTag := f.dim("[" + frame.jniName + "]")
+		// For Throw/ThrowNew, the exception info is in the args or receiver.
+		// The first arg is typically the exception class/object.
+		var classStr, msgStr string
+		if len(frame.args) > 0 {
+			arg0 := frame.args[0]
+			if arg0.Kind == KindObject || arg0.Kind == KindClass {
+				classStr = f.formatClassName(arg0.Str)
+				if arg0.Extra != "" {
+					msgStr = " " + f.colorize(ansiYellow, `"`+arg0.Extra+`"`)
+				}
+			} else {
+				classStr = f.formatJNIValue(arg0)
+			}
+		}
+		// For ThrowNew, the second arg is the message string
+		if frame.jniName == "ThrowNew" && len(frame.args) > 1 {
+			arg1 := frame.args[1]
+			if arg1.Kind == KindString {
+				msgStr = " " + f.colorize(ansiYellow, `"`+arg1.Str+`"`)
+			}
+		}
+		writeLine(logLevelInfo, fmt.Sprintf("%s%s %s%s %s",
+			f.formatOffset(offset),
+			methodTag,
+			classStr,
+			msgStr,
+			f.formatAddress(frame.caller),
+		))
+		return true
+
+	case "ExceptionClear":
+		// Void suppression applies — just emit the tag and caller
+		methodTag := f.dim("[" + frame.jniName + "]")
+		writeLine(logLevelInfo, fmt.Sprintf("%s%s %s",
+			f.formatOffset(offset),
+			methodTag,
+			f.formatAddress(frame.caller),
+		))
+		return true
+
+	case "FatalError":
+		// Message in Red
+		methodTag := f.dim("[" + frame.jniName + "]")
+		var msgStr string
+		if len(frame.args) > 0 && frame.args[0].Kind == KindString {
+			msgStr = f.colorize(ansiRed, frame.args[0].Str)
+		} else if len(frame.args) > 0 {
+			msgStr = f.colorize(ansiRed, f.formatJNIValue(frame.args[0]))
+		}
+		writeLine(logLevelError, fmt.Sprintf("%s%s %s %s",
+			f.formatOffset(offset),
+			methodTag,
+			msgStr,
+			f.formatAddress(frame.caller),
+		))
+		return true
+	}
+
+	return false
 }
 
 // emitInfo logs a plain informational message.

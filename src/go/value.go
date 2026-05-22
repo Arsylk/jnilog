@@ -241,23 +241,19 @@ func buildJNIValue(kind JNIKind, raw string) JNIValue {
 	case KindArray:
 		v.Str = raw
 		// Wire format: sigChar \x04 item1 \x04 item2 ... [\x04 +N]
-		// First byte is the element sigChar; rest are \x04-separated items.
-		if len(raw) > 0 {
+		// First byte is the element sigChar; items are each preceded by \x04.
+		if len(raw) > 1 {
 			itemKind := JNIKindFromSigChar(raw[0])
-			if len(raw) > 1 {
-				parts := strings.Split(raw[1:], "\x04")
-				for _, part := range parts {
-					if part == "" {
+			// raw[1] is always the first \x04 separator; split from raw[2:] to get items
+			parts := strings.Split(raw[2:], "\x04")
+			for _, part := range parts {
+				if strings.HasPrefix(part, "+") {
+					if n, err := strconv.ParseInt(part[1:], 10, 64); err == nil {
+						v.Int = n
 						continue
 					}
-					if strings.HasPrefix(part, "+") {
-						if n, err := strconv.ParseInt(part[1:], 10, 64); err == nil {
-							v.Int = n
-						}
-						continue
-					}
-					v.Items = append(v.Items, buildJNIValue(itemKind, part))
 				}
+				v.Items = append(v.Items, buildJNIValue(itemKind, part))
 			}
 		}
 	case KindPointer:

@@ -61,7 +61,7 @@ static void fill_object_strings(JNIEnv *env, void *obj,
         break;
     case WIRE_KIND_OBJECT:
         *out_str   = vis_object_class_name(env, obj);
-        *out_extra = vis_object_tostring(env, obj);
+        *out_extra = vis_object_tostring_safe(env, obj, *out_str);
         break;
     default:
         break;
@@ -265,6 +265,7 @@ void prepare_field_log_ctx(field_log_ctx_t *ctx, JNIEnv *env, void *receiver,
     field_info_t info = lookup_field_info(field_id);
     ctx->sig        = info.sig;
     ctx->field_name = info.name;
+    ctx->clazz_name = info.clazz;
     set_reentrant_call(0);
 }
 

@@ -37,39 +37,7 @@ typedef struct {
   uint8_t in_use;
 } field_sig_entry_t;
 
-/*
- * method_log_ctx_t — captures all per-call data in typed form.
- *
- * receiver_kind / receiver_str / receiver_extra carry the typed receiver
- * (WIRE_KIND_NULL for static calls).
- * encoded_args is the vis_encode_typed_args() output for Go's decodeArgs().
- */
-typedef struct {
-  int should_log;
-  int logging_ready;
-  int receiver_kind;        /* wire_kind_t cast to int */
-  const char *sig;          /* JNI descriptor string, from cache */
-  const char *method_name;  /* short name, from cache */
-  const char *clazz_name;   /* declaring class, from cache */
-  char caller_str[192];
-  char *receiver_str;       /* heap: class name or string content */
-  char *receiver_extra;     /* heap: toString() for KindObject */
-  char *encoded_args;       /* heap: vis_encode_typed_args() output */
-} method_log_ctx_t;
-
-/*
- * field_log_ctx_t — captures per-field-access data in typed form.
- */
-typedef struct {
-  int should_log;
-  int logging_ready;
-  int receiver_kind;        /* wire_kind_t cast to int */
-  const char *sig;          /* field type descriptor, from cache */
-  const char *field_name;   /* field name, from cache */
-  char caller_str[192];
-  char *receiver_str;       /* heap: class name */
-  char *receiver_extra;     /* heap: toString() */
-} field_log_ctx_t;
+/* method_log_ctx_t and field_log_ctx_t are defined in bridge.h */
 
 typedef union {
   jobject obj;

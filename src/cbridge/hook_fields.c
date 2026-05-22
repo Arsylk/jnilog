@@ -45,7 +45,7 @@ static inline void field_obj_parts(JNIEnv *env, jobject obj,
     } else {
         *out_kind  = WIRE_KIND_OBJECT;
         *out_str   = vis_object_class_name(env, obj);
-        *out_extra = vis_object_tostring(env, obj);
+        *out_extra = vis_object_tostring_safe(env, obj, *out_str);
     }
 }
 
