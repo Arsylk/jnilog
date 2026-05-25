@@ -86,6 +86,16 @@ void method_log_ctx_destroy(method_log_ctx_t *ctx) {
     ctx->encoded_args   = NULL;
 }
 
+/* copy_cache_str — copy a possibly-NULL cache string into a fixed buffer and
+ * point `out_p` at it, returning NULL when src is NULL so callers can tell. */
+static void copy_cache_str(const char **out_p, char *buf, size_t bufsz,
+                            const char *src) {
+    if (!src) { *out_p = NULL; buf[0] = '\0'; return; }
+    strncpy(buf, src, bufsz - 1);
+    buf[bufsz - 1] = '\0';
+    *out_p = buf;
+}
+
 static void prepare_method_log_ctx_common(method_log_ctx_t *ctx, JNIEnv *env,
                                           void *receiver, jmethodID method_id,
                                           void *caller) {
@@ -103,11 +113,13 @@ static void prepare_method_log_ctx_common(method_log_ctx_t *ctx, JNIEnv *env,
     ctx->receiver_kind = (int)classify_object(env, receiver);
     fill_object_strings(env, receiver, &ctx->receiver_str, &ctx->receiver_extra);
 
-    /* Method info from cache */
+    /* Method info from cache — copy into ctx-owned buffers so a concurrent
+     * cache_method_signature on the same slot cannot torn-overwrite the
+     * strings while we still hold them across later vis_* sub-calls. */
     method_info_t info = lookup_method_info(method_id);
-    ctx->sig         = info.sig;
-    ctx->method_name = info.name;
-    ctx->clazz_name  = info.clazz;
+    copy_cache_str(&ctx->sig,         ctx->sig_buf,         sizeof(ctx->sig_buf),         info.sig);
+    copy_cache_str(&ctx->method_name, ctx->method_name_buf, sizeof(ctx->method_name_buf), info.name);
+    copy_cache_str(&ctx->clazz_name,  ctx->clazz_name_buf,  sizeof(ctx->clazz_name_buf),  info.clazz);
     set_reentrant_call(0);
 }
 
@@ -171,8 +183,21 @@ void emit_method_call_begin(call_target_kind_t target_kind, const char *name,
 void log_method_return_value(JNIEnv *env, const method_log_ctx_t *ctx,
                              const char *name, int slot, return_kind_t kind,
                              jni_return_value_t value) {
-    if (!ctx || !ctx->should_log || !ctx->logging_ready
-            || !has_no_exception(env) || is_reentrant_call()) return;
+    if (!ctx || !ctx->should_log || !ctx->logging_ready || is_reentrant_call()) return;
+
+    /* If the underlying call left a pending exception we cannot safely resolve
+     * object types (vis_safe_to_call refuses while an exception is live), but
+     * we MUST still emit a log_jni_return event — the Go-side `popCallFrame`
+     * is keyed off this event and the matching push already happened in
+     * emit_method_call_begin. Skipping the emit leaks the callFrame forever
+     * (and threadStacks[tid] grows unbounded across dead threads).
+     * Degrade to WIRE_KIND_NULL: the formatter renders this as a bare
+     * return-from-throwing-call rather than a misleading value. */
+    if (!has_no_exception(env)) {
+        const char *dname = ctx->method_name ? ctx->method_name : name;
+        log_jni_return(slot, dname, (int)WIRE_KIND_NULL, 0, "", "");
+        return;
+    }
 
     set_reentrant_call(1);
 
@@ -262,10 +287,17 @@ void prepare_field_log_ctx(field_log_ctx_t *ctx, JNIEnv *env, void *receiver,
     ctx->receiver_kind = (int)classify_object(env, receiver);
     fill_object_strings(env, receiver, &ctx->receiver_str, &ctx->receiver_extra);
 
+    /* Copy every cache string into ctx-owned storage:
+     *  - field name may come from a __thread art_name_buf (TLS clobbered by the
+     *    next call on this thread)
+     *  - sig and clazz come from the rwlock-protected cache, but lookup_field_info
+     *    releases the lock before returning the raw pointers; a concurrent
+     *    cache_field_signature on the same slot strncpys in-place over the
+     *    buffers and would torn-write across our reads. */
     field_info_t info = lookup_field_info(field_id);
-    ctx->sig        = info.sig;
-    ctx->field_name = info.name;
-    ctx->clazz_name = info.clazz;
+    copy_cache_str(&ctx->field_name, ctx->field_name_buf, sizeof(ctx->field_name_buf), info.name);
+    copy_cache_str(&ctx->sig,        ctx->sig_buf,        sizeof(ctx->sig_buf),        info.sig);
+    copy_cache_str(&ctx->clazz_name, ctx->clazz_name_buf, sizeof(ctx->clazz_name_buf), info.clazz);
     set_reentrant_call(0);
 }
 
@@ -277,15 +309,18 @@ void emit_field_access_begin(call_target_kind_t target_kind, const char *name,
                              int slot, const field_log_ctx_t *ctx,
                              int value_kind, uintptr_t value_raw,
                              const char *value_str, const char *value_extra) {
+    /* target_kind is retained in the API for symmetry with emit_method_call_begin
+     * (callers can label CALL_TARGET_INSTANCE/STATIC), but ctx->receiver_kind
+     * is already set correctly by prepare_field_log_ctx — KindClass for static
+     * field accesses, KindObject for instance field accesses — so we don't
+     * need to override based on target_kind here. */
+    (void)target_kind;
     if (!ctx || !ctx->should_log || !ctx->logging_ready || is_reentrant_call()) return;
 
     set_reentrant_call(1);
-    int recv_kind = (target_kind == CALL_TARGET_STATIC)
-                        ? ctx->receiver_kind  /* pass class as receiver for static */
-                        : ctx->receiver_kind;
     log_jni_field_access(
         slot, name,
-        recv_kind,
+        ctx->receiver_kind,
         ctx->receiver_str   ? ctx->receiver_str   : "",
         ctx->receiver_extra ? ctx->receiver_extra : "",
         ctx->field_name     ? ctx->field_name     : "?",
@@ -303,8 +338,25 @@ void emit_field_access_begin(call_target_kind_t target_kind, const char *name,
 void log_field_access_result(JNIEnv *env, const field_log_ctx_t *ctx,
                              const char *name, int slot,
                              return_kind_t kind, jni_return_value_t value) {
-    if (!ctx || !ctx->should_log || !ctx->logging_ready
-            || !has_no_exception(env) || is_reentrant_call()) return;
+    if (!ctx || !ctx->should_log || !ctx->logging_ready || is_reentrant_call()) return;
+
+    /* Same rationale as log_method_return_value: never skip the emit on a
+     * pending exception, or the Go-side callFrame leaks. Field access doesn't
+     * actually push a call frame (it's a single log_jni_field_access event,
+     * not a paired call/return), but emitting WIRE_KIND_NULL still gives the
+     * formatter a chance to render the access with a "(threw)" indicator. */
+    if (!has_no_exception(env)) {
+        int recv_kind = ctx->receiver_kind;
+        log_jni_field_access(
+            slot, name,
+            recv_kind,
+            ctx->receiver_str   ? ctx->receiver_str   : "",
+            ctx->receiver_extra ? ctx->receiver_extra : "",
+            ctx->field_name     ? ctx->field_name     : "?",
+            (int)WIRE_KIND_NULL, 0, "", "",
+            ctx->caller_str);
+        return;
+    }
 
     set_reentrant_call(1);
 

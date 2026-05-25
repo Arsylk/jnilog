@@ -216,18 +216,36 @@ void log_jni_register_natives(
     if (!goGetLoggingReady()) return;
     if (!config_is_allowed("RegisterNatives")) return;
 
+    /* Build a comma-separated "name sig @ptr" list, bounded against buf[2048].
+     * Note: snprintf returns the would-have-written length, not the actual.
+     * The previous `p += snprintf(p, end - p, ...)` form advanced p past end
+     * on truncation, then `end - p` (ptrdiff_t) sign-extended to ~SIZE_MAX on
+     * the next iteration → the next snprintf wrote the entire formatted
+     * output past the stack buffer. App-controlled methods[i].name /
+     * signature (no JNI-imposed length limit) triggered the overflow. */
     char buf[2048];
-    char* p = buf;
-    char* end = buf + sizeof(buf) - 1;
-    *p = '\0';
+    size_t pos = 0;
+    buf[0] = '\0';
+#define REGNAT_APPEND(fmt, ...) do { \
+    if (pos + 1 >= sizeof(buf)) break; \
+    size_t _room = sizeof(buf) - pos; /* includes NUL */ \
+    int _w = snprintf(buf + pos, _room, fmt, ##__VA_ARGS__); \
+    if (_w < 0) break; \
+    if ((size_t)_w >= _room) { pos = sizeof(buf) - 1; break; } \
+    pos += (size_t)_w; \
+} while (0)
 
-    for (int i = 0; i < n_methods && p < end; i++) {
-        if (i > 0) p += snprintf(p, end - p, ", ");
-        p += snprintf(p, end - p, "%s %s @%p",
-                     methods[i].name      ? methods[i].name      : "?",
-                     methods[i].signature ? methods[i].signature : "?",
-                     methods[i].fnPtr);
+    for (int i = 0; i < n_methods; i++) {
+        if (i > 0) REGNAT_APPEND("%s", ", ");
+        if (pos + 1 >= sizeof(buf)) break;
+        REGNAT_APPEND("%.200s %.400s @%p",
+                      methods[i].name      ? methods[i].name      : "?",
+                      methods[i].signature ? methods[i].signature : "?",
+                      methods[i].fnPtr);
+        if (pos + 1 >= sizeof(buf)) break;
     }
+#undef REGNAT_APPEND
+    buf[pos] = '\0';
 
     goJNIRegisterNativesCallback((uintptr_t)clazz, (char*)class_name, buf, (char*)caller);
 }

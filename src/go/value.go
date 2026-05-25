@@ -45,35 +45,6 @@ var NullValue = JNIValue{Kind: KindNull}
 // VoidValue is returned by void methods.
 var VoidValue = JNIValue{Kind: KindVoid}
 
-// JNIKindFromReturnKind maps the C return_kind_t int (from bridge.h) to JNIKind.
-// The C side passes this as a plain int through the cgo boundary.
-func JNIKindFromReturnKind(rkind int) JNIKind {
-	switch rkind {
-	case 0:
-		return KindObject
-	case 1:
-		return KindBoolean
-	case 2:
-		return KindByte
-	case 3:
-		return KindChar
-	case 4:
-		return KindShort
-	case 5:
-		return KindInt
-	case 6:
-		return KindLong
-	case 7:
-		return KindFloat
-	case 8:
-		return KindDouble
-	case 9:
-		return KindVoid
-	default:
-		return KindNull
-	}
-}
-
 // JNIKindFromSigChar maps a single JNI descriptor character to JNIKind.
 func JNIKindFromSigChar(ch byte) JNIKind {
 	switch ch {
@@ -132,7 +103,11 @@ func decodeArgs(encoded string) []JNIValue {
 			continue
 		}
 		parts := strings.SplitN(rec, "\x01", 2)
-		if len(parts) != 2 || len(parts[0]) == 0 {
+		// Reject records whose pre-\x01 segment isn't exactly one byte: the
+		// wire contract is a single sigChar before the separator. Tolerating
+		// multi-byte garbage there silently drops everything after the first
+		// byte, which corrupts decoding of any record after the malformed one.
+		if len(parts) != 2 || len(parts[0]) != 1 {
 			continue
 		}
 		kind := JNIKindFromSigChar(parts[0][0])
@@ -242,12 +217,18 @@ func buildJNIValue(kind JNIKind, raw string) JNIValue {
 		v.Str = raw
 		// Wire format: sigChar \x04 item1 \x04 item2 ... [\x04 +N]
 		// First byte is the element sigChar; items are each preceded by \x04.
-		if len(raw) > 1 {
+		// Require at least 3 bytes (sigChar + first \x04 + ≥1 byte payload).
+		// `raw[1] == \x04` AND `len(raw) > 2` together rule out the malformed
+		// 2-byte shape that would otherwise decode to a phantom zero item.
+		if len(raw) > 2 && raw[1] == '\x04' {
 			itemKind := JNIKindFromSigChar(raw[0])
-			// raw[1] is always the first \x04 separator; split from raw[2:] to get items
 			parts := strings.Split(raw[2:], "\x04")
-			for _, part := range parts {
-				if strings.HasPrefix(part, "+") {
+			for i, part := range parts {
+				// The "+N more" overflow marker is only ever emitted by the C
+				// encoder as the LAST element. Restricting the +N parse to the
+				// final position avoids losing legitimate String[] elements
+				// like "+5" when itemKind is non-numeric.
+				if i == len(parts)-1 && strings.HasPrefix(part, "+") {
 					if n, err := strconv.ParseInt(part[1:], 10, 64); err == nil {
 						v.Int = n
 						continue

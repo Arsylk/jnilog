@@ -1,4 +1,4 @@
-module jnilog_payload
+module jnilog
 
 go 1.26.2
 

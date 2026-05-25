@@ -293,9 +293,8 @@ func genConfig(t *rapid.T) Config {
 		regexPats[i] = pat
 	}
 
-	// Array items and stack depth
+	// Array items
 	arrayItems := rapid.IntRange(1, 50).Draw(t, "arrayItems")
-	stackDepth := rapid.IntRange(0, 10).Draw(t, "stackDepth")
 
 	c := Config{
 		Functions:  funcs,
@@ -306,7 +305,6 @@ func genConfig(t *rapid.T) Config {
 			Regex:      regexPats,
 		},
 		ArrayItems: arrayItems,
-		StackDepth: stackDepth,
 	}
 
 	// Build the derived sets
@@ -353,9 +351,6 @@ func TestGenConfig(t *testing.T) {
 		c := genConfig(t)
 		if c.ArrayItems < 1 {
 			t.Fatalf("genConfig produced ArrayItems < 1: %d", c.ArrayItems)
-		}
-		if c.StackDepth < 0 {
-			t.Fatalf("genConfig produced negative StackDepth: %d", c.StackDepth)
 		}
 	})
 }

@@ -43,7 +43,6 @@
 static char g_range_package_name[RANGESET_MAX_PACKAGE_NAME] = {0};
 static pthread_mutex_t g_range_pkg_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static struct link_map *g_last_link_map = NULL;
 
 /* Forward declaration — defined here because c_set_package_name (below) resets
  * it.  Prevents hot-path retry storms: once we've attempted seeding and found
@@ -65,18 +64,23 @@ void c_set_package_name(const char *name) {
 #endif
   pthread_mutex_unlock(&g_range_pkg_lock);
 
-  /* Reset the link_map cursor so the next c_seed_exec_ranges_from_maps()
-   * performs a full rescan even if it already ran before the name was known. */
-  g_last_link_map = NULL;
-
   /* Reset the seed-attempted flag so the hot path will re-attempt seeding
    * now that we have a valid package name. */
   g_seed_attempted = 0;
 }
 
+/* Strictly speaking the package-name buffer can be rewritten more than once
+ * (refresh_package_name_if_needed retries until a non-zygote name resolves),
+ * so callers must either hold the lock or accept the snapshot we return. To
+ * avoid handing out a raw pointer that races with the writer, return a
+ * thread-local snapshot. */
 const char *c_get_package_name(void) {
-  /* Safe after init — package name is set once and never changed */
-  return g_range_package_name;
+  static __thread char snap[RANGESET_MAX_PACKAGE_NAME];
+  pthread_mutex_lock(&g_range_pkg_lock);
+  strncpy(snap, g_range_package_name, sizeof(snap) - 1);
+  snap[sizeof(snap) - 1] = '\0';
+  pthread_mutex_unlock(&g_range_pkg_lock);
+  return snap;
 }
 
 static void refresh_package_name_if_needed(void) {
@@ -111,7 +115,6 @@ static void refresh_package_name_if_needed(void) {
         if (len > 0 && len < RANGESET_MAX_PACKAGE_NAME) {
           strncpy(g_range_package_name, pkg_start, len);
           g_range_package_name[len] = '\0';
-          g_last_link_map = NULL;
 #if __has_include(<android/log.h>)
           __android_log_print(ANDROID_LOG_INFO, RANGESET_LOG_TAG,
                               "package name resolved from lib path: '%s'",
@@ -140,7 +143,6 @@ static void refresh_package_name_if_needed(void) {
           strstr(buf, "<pre-initialized>") == NULL) {
         strncpy(g_range_package_name, buf, RANGESET_MAX_PACKAGE_NAME - 1);
         g_range_package_name[RANGESET_MAX_PACKAGE_NAME - 1] = '\0';
-        g_last_link_map = NULL;
 #if __has_include(<android/log.h>)
         __android_log_print(ANDROID_LOG_INFO, RANGESET_LOG_TAG,
                             "package name resolved from cmdline: '%s'",
@@ -157,9 +159,16 @@ int c_path_contains_package(const char *path) {
   refresh_package_name_if_needed();
   if (path == NULL || path[0] == '\0')
     return 0;
-  if (g_range_package_name[0] == '\0')
+  /* Take a snapshot under the lock so a concurrent refresh_package_name_if_needed
+   * cannot torn-overwrite the strstr target mid-scan. */
+  char snap[RANGESET_MAX_PACKAGE_NAME];
+  pthread_mutex_lock(&g_range_pkg_lock);
+  strncpy(snap, g_range_package_name, sizeof(snap) - 1);
+  snap[sizeof(snap) - 1] = '\0';
+  pthread_mutex_unlock(&g_range_pkg_lock);
+  if (snap[0] == '\0')
     return 0;
-  return strstr(path, g_range_package_name) != NULL ? 1 : 0;
+  return strstr(path, snap) != NULL ? 1 : 0;
 }
 
 /* ====================================================================
@@ -207,7 +216,9 @@ int c_add_exec_range(uintptr_t base, uintptr_t size) {
   if (g_exec_range_count < MAX_EXEC_RANGES) {
     g_exec_ranges[g_exec_range_count].base = base;
     g_exec_ranges[g_exec_range_count].end = end;
-    g_exec_range_count++;
+    /* Release-store paired with the acquire-loads in c_has_exec_ranges /
+     * c_should_try_seed so observers of count>0 also see the writes above. */
+    __atomic_store_n(&g_exec_range_count, g_exec_range_count + 1, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_range_lock);
     return 1;
   }
@@ -220,27 +231,39 @@ int c_is_in_exec_range(uintptr_t addr) {
   if (addr == 0)
     return 0;
 
-  /* Snapshot count under lock, then scan locklessly (ranges are append-only) */
+  /* Hold the lock for the entire scan. The earlier snapshot-then-scan
+   * pattern was unsafe because c_add_exec_range mutates an existing entry's
+   * base/end fields in-place under the merge branch (lines 213-217). A
+   * lockless reader could observe (new_base, old_end) or (old_base, new_end)
+   * — torn (base,end) pairs — causing transient mis-classification of the
+   * caller address. The scan is bounded by MAX_EXEC_RANGES (1024) and
+   * read-only, so taking the mutex adds only a few hundred cycles on the
+   * hot path. */
   pthread_mutex_lock(&g_range_lock);
   int count = g_exec_range_count;
-  pthread_mutex_unlock(&g_range_lock);
-
+  int hit = 0;
   for (int i = 0; i < count; i++) {
     if (addr >= g_exec_ranges[i].base && addr < g_exec_ranges[i].end) {
-      return 1;
+      hit = 1;
+      break;
     }
   }
-  return 0;
+  pthread_mutex_unlock(&g_range_lock);
+  return hit;
 }
 
-int c_has_exec_ranges(void) { return g_exec_range_count > 0; }
+int c_has_exec_ranges(void) {
+  /* Acquire-load to pair with the release-store inside c_add_exec_range,
+   * so callers observing count>0 also see the matching range writes. */
+  return __atomic_load_n(&g_exec_range_count, __ATOMIC_ACQUIRE) > 0;
+}
 
 /* Returns true if we should attempt seeding (either we have no ranges AND
  * haven't tried yet, or we already have ranges).  This prevents the hot-path
  * from calling c_seed_exec_ranges_from_maps() on every JNI hook. */
 int c_should_try_seed(void) {
-  if (g_exec_range_count > 0) return 0;  /* already have ranges */
-  if (g_seed_attempted) return 0;         /* already tried and failed */
+  if (__atomic_load_n(&g_exec_range_count, __ATOMIC_ACQUIRE) > 0) return 0;
+  if (g_seed_attempted) return 0;
   return 1;
 }
 
@@ -251,45 +274,8 @@ void c_reset_seed_attempted(void) {
 }
 
 /* ====================================================================
- * solist scanning via link_map
+ * solist scanning via dl_iterate_phdr (linker-locked iteration)
  * ==================================================================== */
-
-#include <sys/auxv.h>
-
-static struct r_debug *find_r_debug(void) {
-  ElfW(Phdr) *phdr = (ElfW(Phdr) *)getauxval(AT_PHDR);
-  if (!phdr) return NULL;
-
-  unsigned long phnum = getauxval(AT_PHNUM);
-  if (!phnum) return NULL;
-
-  ElfW(Addr) pt_phdr_vaddr = 0;
-  ElfW(Addr) pt_dynamic_vaddr = 0;
-  int found_phdr = 0, found_dynamic = 0;
-
-  for (unsigned long i = 0; i < phnum; i++) {
-    if (phdr[i].p_type == PT_PHDR) {
-      pt_phdr_vaddr = phdr[i].p_vaddr;
-      found_phdr = 1;
-    } else if (phdr[i].p_type == PT_DYNAMIC) {
-      pt_dynamic_vaddr = phdr[i].p_vaddr;
-      found_dynamic = 1;
-    }
-  }
-
-  if (!found_phdr || !found_dynamic) return NULL;
-
-  uintptr_t load_base = (uintptr_t)phdr - pt_phdr_vaddr;
-  ElfW(Dyn) *dyn = (ElfW(Dyn) *)(load_base + pt_dynamic_vaddr);
-
-  for (; dyn->d_tag != DT_NULL; dyn++) {
-    if (dyn->d_tag == DT_DEBUG) {
-      return (struct r_debug *)(uintptr_t)dyn->d_un.d_ptr;
-    }
-  }
-
-  return NULL;
-}
 
 int c_is_system_lib_path(const char *path) {
   if (path == NULL || path[0] == '\0' || path[0] != '/') return 1;
@@ -310,6 +296,48 @@ int c_is_system_lib_path(const char *path) {
 /* Forward declaration for /proc/self/maps fallback */
 static int c_seed_exec_ranges_from_proc_maps(void);
 
+/* dl_iterate_phdr callback context — populated once, then driven by the loader
+ * iterating each loaded module under its internal lock. Replaces the manual
+ * r_debug→link_map walk which had no synchronization with the dynamic linker
+ * and could SIGSEGV on concurrent dlclose. */
+typedef struct {
+  char pkg_snap[RANGESET_MAX_PACKAGE_NAME];
+  const void *self_fbase;
+  int added;
+} seed_ctx_t;
+
+static int seed_iter_cb(struct dl_phdr_info *info, size_t size, void *data) {
+  (void)size;
+  seed_ctx_t *ctx = (seed_ctx_t *)data;
+
+  const char *lib_name = info->dlpi_name;
+  if (lib_name == NULL || lib_name[0] == '\0') return 0;
+
+  /* Exclude our own payload by load-base identity and by name. */
+  if (ctx->self_fbase && (const void *)info->dlpi_addr == ctx->self_fbase) return 0;
+  if (strstr(lib_name, "libjnilog") != NULL) return 0;
+
+  /* Skip system libs / non-package paths. pkg_snap is the locked snapshot
+   * (no race with a concurrent refresh_package_name_if_needed writer). */
+  if (c_is_system_lib_path(lib_name)) return 0;
+  if (ctx->pkg_snap[0] == '\0' || strstr(lib_name, ctx->pkg_snap) == NULL) return 0;
+
+  for (uint16_t i = 0; i < info->dlpi_phnum; i++) {
+    if (info->dlpi_phdr[i].p_type != PT_LOAD) continue;
+    uintptr_t start = (uintptr_t)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+    uintptr_t size_mem = info->dlpi_phdr[i].p_memsz;
+    if (size_mem > 0 && c_add_exec_range(start, size_mem)) {
+#if __has_include(<android/log.h>)
+      __android_log_print(ANDROID_LOG_DEBUG, RANGESET_LOG_TAG,
+                          C_DIM "range added:" C_RESET " " C_LAVENDER "%lx-%lx" C_RESET " " C_YELLOW "%s" C_RESET,
+                          (unsigned long)start, (unsigned long)(start + size_mem), lib_name);
+#endif
+      ctx->added++;
+    }
+  }
+  return 0; /* keep iterating */
+}
+
 int c_seed_exec_ranges_from_maps(void) {
   /* Refresh the package name first — the process may have been specialized
    * (renamed from zygote64 to com.termux) since the last attempt. */
@@ -317,89 +345,50 @@ int c_seed_exec_ranges_from_maps(void) {
 
   int added = 0;
 
-  struct r_debug *dbg = find_r_debug();
-  if (dbg && dbg->r_map) {
-    struct link_map *last_map = dbg->r_map;
-    while (last_map->l_next) {
-      last_map = last_map->l_next;
-    }
+  /* Snapshot the package name under the lock; the callback sees a stable copy. */
+  seed_ctx_t ctx;
+  pthread_mutex_lock(&g_range_pkg_lock);
+  strncpy(ctx.pkg_snap, g_range_package_name, sizeof(ctx.pkg_snap) - 1);
+  ctx.pkg_snap[sizeof(ctx.pkg_snap) - 1] = '\0';
+  pthread_mutex_unlock(&g_range_pkg_lock);
+  ctx.added = 0;
 
-    /* Skip re-scan only when the link_map tail hasn't changed AND we already
-     * have a valid package name (otherwise the previous scan was a no-op). */
-    int skip_link_map = (g_last_link_map == last_map && g_range_package_name[0] != '\0' &&
-        strstr(g_range_package_name, "zygote") == NULL &&
-        strstr(g_range_package_name, "app_process") == NULL &&
-        strstr(g_range_package_name, "<pre-initialized>") == NULL);
+  Dl_info self_info;
+  ctx.self_fbase = NULL;
+  if (dladdr((void *)c_seed_exec_ranges_from_maps, &self_info)) {
+    ctx.self_fbase = self_info.dli_fbase;
+  }
 
-    if (!skip_link_map) {
-      g_last_link_map = last_map;
+  /* Only iterate when we have a real package name. The seed-attempted flag in
+   * c_should_try_seed prevents repeat iteration once we've tried; the previous
+   * code's link_map-tail-identity skip optimization is no longer needed. */
+  if (ctx.pkg_snap[0] != '\0' &&
+      strstr(ctx.pkg_snap, "zygote") == NULL &&
+      strstr(ctx.pkg_snap, "app_process") == NULL &&
+      strstr(ctx.pkg_snap, "<pre-initialized>") == NULL) {
+    /* dl_iterate_phdr holds bionic's loader lock while iterating, so we
+     * can't be racing with dlopen/dlclose on another thread. */
+    dl_iterate_phdr(seed_iter_cb, &ctx);
+  }
 
-      for (struct link_map *map = dbg->r_map; map; map = map->l_next) {
-        const char* lib_name = map->l_name;
-        Dl_info info;
-        if (dladdr((void*)map->l_addr, &info) && info.dli_fname != NULL && info.dli_fname[0] != '\0') {
-          lib_name = info.dli_fname;
-        }
-
-        if (lib_name == NULL || lib_name[0] == '\0') {
-          continue;
-        }
-
-        /* Exclude our own payload module by load base address */
-        Dl_info self_info;
-        if (dladdr((void*)c_seed_exec_ranges_from_maps, &self_info)) {
-          if (map->l_addr == (ElfW(Addr))self_info.dli_fbase) {
-            continue;
-          }
-        }
-
-        /* Fallback string-based exclusion */
-        if (strstr(lib_name, "libjnilog") != NULL) {
-          continue;
-        }
-
-        int has_pkg = c_path_contains_package(lib_name);
-        if (!has_pkg) {
-          continue;
-        }
-
-        ElfW(Addr) load_bias = map->l_addr;
-        ElfW(Ehdr) *ehdr = (ElfW(Ehdr) *)load_bias;
-
-    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
-      continue;
-    }
-
-    ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)ehdr + ehdr->e_phoff);
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-      if (phdr[i].p_type == PT_LOAD) {
-        uintptr_t start = (uintptr_t)(load_bias + phdr[i].p_vaddr);
-        uintptr_t size_mem = phdr[i].p_memsz;
-        
-        if (size_mem > 0 && c_add_exec_range(start, size_mem)) {
-#if __has_include(<android/log.h>)
-          __android_log_print(ANDROID_LOG_DEBUG, RANGESET_LOG_TAG,
-                              C_DIM "range added:" C_RESET " " C_LAVENDER "%lx-%lx" C_RESET " " C_YELLOW "%s" C_RESET,
-                              (unsigned long)start, (unsigned long)(start + size_mem), map->l_name);
-#endif
-          added++;
-        }
-      }
-    }
-    } /* end for (link_map) */
-    } /* end if (!skip_link_map) */
-  } /* end if (dbg && dbg->r_map) */
+  added += ctx.added;
 
   /* Fallback: if link_map scan found nothing, try /proc/self/maps directly.
    * This catches libraries in classloader namespaces (System.loadLibrary). */
   if (!c_has_exec_ranges()) {
     added += c_seed_exec_ranges_from_proc_maps();
 #if __has_include(<android/log.h>)
-    if (added == 0 && g_range_package_name[0] != '\0' &&
-        strstr(g_range_package_name, "zygote") == NULL) {
-      __android_log_print(ANDROID_LOG_WARN, RANGESET_LOG_TAG,
-                          "seed fallback: no ranges found for pkg '%s' (maps scan returned 0)",
-                          g_range_package_name);
+    if (added == 0) {
+      char warn_snap[RANGESET_MAX_PACKAGE_NAME];
+      pthread_mutex_lock(&g_range_pkg_lock);
+      strncpy(warn_snap, g_range_package_name, sizeof(warn_snap) - 1);
+      warn_snap[sizeof(warn_snap) - 1] = '\0';
+      pthread_mutex_unlock(&g_range_pkg_lock);
+      if (warn_snap[0] != '\0' && strstr(warn_snap, "zygote") == NULL) {
+        __android_log_print(ANDROID_LOG_WARN, RANGESET_LOG_TAG,
+                            "seed fallback: no ranges found for pkg '%s' (maps scan returned 0)",
+                            warn_snap);
+      }
     }
 #endif
   }
@@ -415,10 +404,17 @@ int c_seed_exec_ranges_from_maps(void) {
  * This catches libraries loaded via classloader namespaces that don't appear in
  * the global link_map (e.g., app native libraries loaded via System.loadLibrary). */
 static int c_seed_exec_ranges_from_proc_maps(void) {
-  if (g_range_package_name[0] == '\0' ||
-      strstr(g_range_package_name, "zygote") != NULL ||
-      strstr(g_range_package_name, "app_process") != NULL ||
-      strstr(g_range_package_name, "<pre-initialized>") != NULL) {
+  /* Snapshot g_range_package_name under the lock; refresh_package_name_if_needed
+   * can torn-overwrite it from another thread. */
+  char pkg_snap[RANGESET_MAX_PACKAGE_NAME];
+  pthread_mutex_lock(&g_range_pkg_lock);
+  strncpy(pkg_snap, g_range_package_name, sizeof(pkg_snap) - 1);
+  pkg_snap[sizeof(pkg_snap) - 1] = '\0';
+  pthread_mutex_unlock(&g_range_pkg_lock);
+  if (pkg_snap[0] == '\0' ||
+      strstr(pkg_snap, "zygote") != NULL ||
+      strstr(pkg_snap, "app_process") != NULL ||
+      strstr(pkg_snap, "<pre-initialized>") != NULL) {
     return 0;
   }
 
@@ -469,8 +465,11 @@ static int c_seed_exec_ranges_from_proc_maps(void) {
     /* Skip our own payload */
     if (strstr(path, "libjnilog") != NULL) continue;
 
-    /* Check if path contains the package name */
-    if (strstr(path, g_range_package_name) == NULL) continue;
+    /* Check if path contains the package name. Use the locked snapshot
+     * (pkg_snap) taken at the top of this function — reading
+     * g_range_package_name raw here would race a concurrent
+     * refresh_package_name_if_needed writer mid-strstr. */
+    if (strstr(path, pkg_snap) == NULL) continue;
 
     uintptr_t size = end - start;
     if (size > 0 && c_add_exec_range(start, size)) {
@@ -496,7 +495,8 @@ void c_init_range_tracking(void) {
 
   pthread_mutex_lock(&g_range_pkg_lock);
   char buf[RANGESET_MAX_PACKAGE_NAME];
-  strncpy(buf, g_range_package_name, sizeof(buf));
+  strncpy(buf, g_range_package_name, sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
   pthread_mutex_unlock(&g_range_pkg_lock);
 
   if (buf[0] == '\0') {

@@ -1724,17 +1724,10 @@ func TestThreeTierGateFiltering(t *testing.T) {
 		// Generate a random configuration
 		c := genConfig(t)
 
-		// Install the config globally (protected by mutex)
-		cfgMu.Lock()
-		cfg = c
-		cfgMu.Unlock()
-
-		// Restore default config after this iteration
-		defer func() {
-			cfgMu.Lock()
-			cfg = Config{}
-			cfgMu.Unlock()
-		}()
+		// Install the config globally via the atomic.Pointer swap.
+		// (No mutex needed — readers do a single atomic load.)
+		cfg.Store(&c)
+		defer cfg.Store(emptyConfig)
 
 		// Generate a JNI function name — either from the known set or arbitrary
 		useKnown := rapid.Bool().Draw(t, "useKnownName")

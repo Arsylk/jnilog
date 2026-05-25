@@ -14,8 +14,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"sync"
-	"unsafe"
+	"sync/atomic"
 )
 
 // ============================================================================
@@ -30,13 +29,12 @@ type ExcludeRule struct {
 }
 
 // Config is the top-level configuration structure.
-// Zero values mean "use default" — everything on, array depth 16, no stack.
+// Zero values mean "use default" — everything on, array depth 16.
 type Config struct {
 	Functions  []string    `json:"functions"`
 	Categories []string    `json:"categories"`
 	Exclude    ExcludeRule `json:"exclude"`
 	ArrayItems int         `json:"array_items"`
-	StackDepth int         `json:"stack_depth"`
 
 	// Populated after parsing (not in JSON):
 	enabledSet   map[string]bool
@@ -44,10 +42,20 @@ type Config struct {
 	regexList    []*regexp.Regexp
 }
 
-var (
-	cfg   Config
-	cfgMu sync.RWMutex
-)
+// cfg holds the parsed configuration. Stored once at startup (and any future
+// hot-reload) via atomic.Pointer so every C-side gate query — which fires on
+// every JNI event — is a single atomic load instead of an RWMutex round-trip.
+// Readers MUST treat the loaded *Config as immutable.
+var cfg atomic.Pointer[Config]
+
+// emptyConfig is what `loadCfg` returns before loadConfig has run. Keeping it
+// non-nil avoids a NULL check on every gate query.
+var emptyConfig = &Config{}
+
+func init() { cfg.Store(emptyConfig) }
+
+// loadCfg returns the current (immutable) Config.
+func loadCfg() *Config { return cfg.Load() }
 
 // ============================================================================
 // Category definitions — maps a category name to a list of JNI function names.
@@ -143,15 +151,37 @@ var categories = map[string][]string{
 // Config discovery and parsing — called once at startup.
 // ============================================================================
 
+// maxConfigBytes caps loadConfig's file read. The default config path lives
+// in a world-writable directory (/data/local/tmp), and JNILOG_CONFIG accepts
+// any path with the target process's privileges — so a hostile or merely
+// large file shouldn't be able to OOM the target or feed multi-MB strings
+// back through the error log.
+const maxConfigBytes = 1 << 20 // 1 MiB
+
 func loadConfig() {
 	path := os.Getenv("JNILOG_CONFIG")
 	if path == "" {
 		path = "/data/local/tmp/jnilog.json"
 	}
 
-	data, err := os.ReadFile(path)
+	st, err := os.Stat(path)
 	if err != nil {
 		logNativeInfo(fmt.Sprintf("config: no config file at %s, using defaults", path))
+		return
+	}
+	if !st.Mode().IsRegular() {
+		logNativeWarn(fmt.Sprintf("config: %s is not a regular file, ignoring", path))
+		return
+	}
+	if st.Size() > maxConfigBytes {
+		logNativeWarn(fmt.Sprintf("config: %s is %d bytes (> %d cap), ignoring",
+			path, st.Size(), maxConfigBytes))
+		return
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		logNativeInfo(fmt.Sprintf("config: failed to read %s: %v", path, err))
 		return
 	}
 
@@ -164,22 +194,17 @@ func loadConfig() {
 	if c.ArrayItems <= 0 {
 		c.ArrayItems = 16
 	}
-	if c.StackDepth < 0 {
-		c.StackDepth = 0
-	}
 
 	buildEnabledSet(&c)
 	buildBlacklistSet(&c)
 	buildRegexList(&c)
 
-	cfgMu.Lock()
-	cfg = c
-	cfgMu.Unlock()
+	cfg.Store(&c)
 
-	logNativeInfo(fmt.Sprintf("config: loaded %s (enabled=%d, blacklisted=%d, regex=%d, array=%d, stack=%d)",
+	logNativeInfo(fmt.Sprintf("config: loaded %s (enabled=%d, blacklisted=%d, regex=%d, array=%d)",
 		path,
 		len(c.enabledSet), len(c.blacklistSet), len(c.regexList),
-		c.ArrayItems, c.StackDepth))
+		c.ArrayItems))
 }
 
 func buildEnabledSet(c *Config) {
@@ -230,12 +255,8 @@ func buildRegexList(c *Config) {
 //export config_function_blacklisted
 func config_function_blacklisted(cName *C.char) C.int {
 	name := C.GoString(cName)
-	cfgMu.RLock()
-	defer cfgMu.RUnlock()
-	if cfg.blacklistSet == nil {
-		return 0
-	}
-	if cfg.blacklistSet[name] {
+	c := loadCfg()
+	if c.blacklistSet != nil && c.blacklistSet[name] {
 		return 1
 	}
 	return 0
@@ -244,12 +265,11 @@ func config_function_blacklisted(cName *C.char) C.int {
 //export config_function_enabled
 func config_function_enabled(cName *C.char) C.int {
 	name := C.GoString(cName)
-	cfgMu.RLock()
-	defer cfgMu.RUnlock()
-	if cfg.enabledSet == nil {
+	c := loadCfg()
+	if c.enabledSet == nil {
 		return 1
 	}
-	if cfg.enabledSet[name] {
+	if c.enabledSet[name] {
 		return 1
 	}
 	return 0
@@ -257,19 +277,11 @@ func config_function_enabled(cName *C.char) C.int {
 
 //export config_array_max_items
 func config_array_max_items() C.int {
-	cfgMu.RLock()
-	defer cfgMu.RUnlock()
-	if cfg.ArrayItems > 0 {
-		return C.int(cfg.ArrayItems)
+	c := loadCfg()
+	if c.ArrayItems > 0 {
+		return C.int(c.ArrayItems)
 	}
 	return 16
-}
-
-//export config_stack_depth
-func config_stack_depth() C.int {
-	cfgMu.RLock()
-	defer cfgMu.RUnlock()
-	return C.int(cfg.StackDepth)
 }
 
 // ============================================================================
@@ -359,12 +371,11 @@ func callKeyForFieldTarget(jniName, className, fieldName string, value JNIValue)
 // configSignatureBlacklisted checks whether the given call key matches any
 // exclude regex pattern.
 func configSignatureBlacklisted(key string) bool {
-	cfgMu.RLock()
-	defer cfgMu.RUnlock()
-	if cfg.regexList == nil {
+	c := loadCfg()
+	if c.regexList == nil {
 		return false
 	}
-	for _, re := range cfg.regexList {
+	for _, re := range c.regexList {
 		if re.MatchString(key) {
 			return true
 		}
@@ -372,10 +383,3 @@ func configSignatureBlacklisted(key string) bool {
 	return false
 }
 
-// logNativeInfo / logNativeWarn — duplicates from rangeset.go for config startup.
-// These are defined here with local helpers to avoid circular import concerns.
-func logNativeConf(priority int, msg string) {
-	cMsg := C.CString(msg)
-	defer C.free(unsafe.Pointer(cMsg))
-	goLogNative(C.int(priority), cMsg)
-}

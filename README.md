@@ -8,17 +8,24 @@ Inspired by [frida-jnitrace](https://github.com/iddoeldor/frida-jnitrace).  No F
 
 ## Quick Start
 
+Requires the Android NDK (set `ANDROID_NDK_HOME` or `ANDROID_NDK`) and Go ≥ 1.26.
+
 ```bash
-# Build the payload
-xmake b jnilog_payload                     # produces build/libjnilog.so
+# Build the payload (produces dist/libjnilog.so)
+xmake b jnilog
 
-# Inject into an app (stealth mode — ephemeral payload, self-deleting)
-xmake run-stealth --pkg=com.example.app --logcat
+# Push to a connected device
+xmake push                                 # convenience: adb push dist/libjnilog.so /data/local/tmp/
 
-# Filter with a config file
+# Filter with a config file (optional)
 echo '{"exclude":{"categories":["refs","strings"]}}' | adb shell tee /data/local/tmp/jnilog.json
-xmake run-stealth --pkg=com.example.app --logcat
 ```
+
+Injection into a target process is out of scope for this build — load the produced
+`.so` with your preferred mechanism (e.g. `LD_PRELOAD`, ptrace-based injector, or
+the Zygisk module pattern). The library detects its environment in
+`library_constructor` and self-installs the JNI table hooks when a `JavaVM` is
+available.
 
 ---
 
@@ -31,7 +38,7 @@ xmake run-stealth --pkg=com.example.app --logcat
 │                  • mprotect interception (live map tracking) │
 │                  • VM table hook (GetEnv → new threads)      │
 ├──────────────────────────────────────────────────────────────┤
-│  hooks.c (1,435) Core hook table + 90 utility hooks          │
+│  hooks.c         Core hook table + ~90 utility hooks         │
 │  hook_methods.c  All Call*Method variants via X-macros       │
 │  hook_fields.c   All Get/Set*Field variants via X-macros     │
 │  hook_internal.h Types, enums, 3 X-macro type lists          │
@@ -40,8 +47,8 @@ xmake run-stealth --pkg=com.example.app --logcat
 │  hook_common.c   Method/field caches, reentrancy, config     │
 ├──────────────────────────────────────────────────────────────┤
 │  visualize.c     JNI object introspection (class name,       │
-│                  toString, array elements, type detection)    │
-│  vis_encode_typed_args.c  Method arg → wire format           │
+│                  toString, array elements, type detection)   │
+│                  + vis_encode_typed_args (method arg → wire) │
 ├──────────────────────────────────────────────────────────────┤
 │  bridge.c        ART symbol resolution, Go↔C glue            │
 │  rangeset.c      /proc/self/maps caller filtering            │
@@ -177,8 +184,7 @@ Place a JSON file at `/data/local/tmp/jnilog.json` (or set `JNILOG_CONFIG` env v
     "categories": [],      // Blacklist category expansion.
     "regex":      []       // Regex patterns matched against call-key strings.
   },
-  "array_items": 16,       // Max array elements before "+N more" truncation.
-  "stack_depth": 0         // Native stack frames to unwind (0 = off).
+  "array_items": 16        // Max array elements before "+N more" truncation.
 }
 ```
 
@@ -191,7 +197,7 @@ Place a JSON file at `/data/local/tmp/jnilog.json` (or set `JNILOG_CONFIG` env v
 | `exceptions` | 7 | `Throw`, `ThrowNew`, `Exception*`, `FatalError` |
 | `arrays` | 44 | All `New*Array`, `Get/Set/Release*Array*`, `GetArrayLength`, `SetObjectArrayElement` |
 | `strings` | 10 | All `*String*` operations |
-| `refs` | 9 | All `*GlobalRef`, `*LocalRef`, `IsSameObject`, `Push/PopLocalFrame` |
+| `refs` | 10 | All `*GlobalRef`, `*LocalRef`, `IsSameObject`, `Push/PopLocalFrame`, `EnsureLocalCapacity` |
 | `lookups` | 5 | `FindClass`, `GetMethodID`, `GetStaticMethodID`, `GetFieldID`, `GetStaticFieldID` |
 
 ### Three-tier gate system
@@ -306,72 +312,84 @@ JNI call enters hook
 ## Building
 
 **Requirements:**
-- Android NDK (for `aarch64-linux-android21-clang`)
-- Go 1.20+ with `CGO_ENABLED=1`
+- Android NDK (for `aarch64-linux-android21-clang`) — set `ANDROID_NDK_HOME` or `ANDROID_NDK`
+- Go ≥ 1.26 with `CGO_ENABLED=1` (set automatically by the xmake target)
 - xmake (build orchestration)
 
 ```bash
 # Build the payload library
-xmake b jnilog_payload
-# → build/libjnilog.so (ARM64)
+xmake b jnilog
+# → dist/libjnilog.so (ARM64)
 
-# Build the injector
-xmake b injector
+# Push to a connected device
+xmake push
 ```
 
-The payload is a **cgo shared library** — Go handles `CGO_ENABLED=1` and links `encoding/json`, `regexp`, and the Go runtime statically.
+The payload is a **cgo shared library** — `go build -buildmode=c-shared` produces a
+single `.so` containing the Go runtime plus the C hook layer, linking
+`encoding/json`, `regexp`, and the Go runtime statically.
 
 ---
 
-## Injection
+## Loading the payload into a target process
 
-```bash
-# Stealth mode (recommended)
-# Copies payload to app-private cache dir, dlopens from there, unlinks after load
-xmake run-stealth --pkg=com.example.app --logcat
+This repository ships only the payload `.so` — loading it into a target process
+is intentionally out of scope. Pick the injection vector that fits your context:
 
-# With config
-JNILOG_CONFIG=/data/local/tmp/my-config.json xmake run-stealth --pkg=com.example.app --logcat
-```
+- **`LD_PRELOAD`** — works for a fresh fork of an executable you control. The
+  payload constructor detects this case via the `LD_PRELOAD` env var and
+  initializes synchronously instead of using a background thread.
+- **Zygote-time injection** — patch `__loader_dlopen` in zygote's `libdl.so` GOT
+  so every spawned app inherits the loader hook. The shipped payload includes
+  this self-installing logic in `library_constructor`, but it requires that the
+  payload itself already be loaded into zygote (separate boot-time tool).
+- **Process-attached injection** — `ptrace`-based injectors (e.g. parasite-style
+  shellcode) that force-load the payload into a running PID.
+- **Zygisk module** — wrap the payload as a Zygisk module so Magisk handles the
+  zygote injection lifecycle.
 
-The injector works by:
-1. Patching `__loader_dlopen` in zygote's `libdl.so` GOT — all future child processes inherit the hook
-2. Applying a shellcode trap on `setArgV0` in zygote — triggers when the app is about to launch
-3. Shellcode calls `dlopen` on the ephemeral payload from within the app's process context
-4. Payload constructor runs → Go runtime init → JNI table swapped → logging begins
-5. Ephemeral payload file is unlinked — no trace on disk
+On load, the constructor runs through `init_once_handler` (`main.c`):
+1. Resolve `JNI_GetCreatedJavaVMs` / `JNI_OnLoad` in `libart.so`.
+2. Run `bridge_init` (Go bridge + ART symbol resolution).
+3. Patch `__loader_dlopen` / `__loader_android_dlopen_ext` in `libdl.so`.
+4. If a `JavaVM` already exists, install the JNI-table hooks immediately;
+   otherwise wait for `JNI_OnLoad` / `GetEnv` to provide one.
+
+Per-process config is read from `/data/local/tmp/jnilog.json` (or
+`JNILOG_CONFIG=<path>`); see [`docs/CONFIG_SCHEMA.json`](docs/CONFIG_SCHEMA.json).
 
 ---
 
 ## Project Structure
 
 ```
-jnilog_payload/
+jnilog/
 ├── src/
 │   ├── cbridge/                   # C layer (hooks, injection, visualization)
 │   │   ├── main.c                 # Constructor, PLT/GOT patching, VM hooks
 │   │   ├── bridge.c/.h            # ART symbol resolution, Go↔C funnel functions
-│   │   ├── hooks.c                # Hook table (90+ install entries), utility hooks
-│   │   ├── hook_methods.c         # Call*Method variants (93 hooks via X-macros)
-│   │   ├── hook_fields.c          # Get/Set*Field variants (36 hooks via X-macros)
+│   │   ├── hooks.c                # JNI table slot assignments + utility hooks
+│   │   ├── hook_methods.c         # Call*Method variants (X-macro generated)
+│   │   ├── hook_fields.c          # Get/Set*Field variants (X-macro generated)
 │   │   ├── hook_logging.c         # Method/field log contexts, wire encoding dispatch
 │   │   ├── hook_common.c          # Caches, reentrancy guards, config query cache
 │   │   ├── hook_internal.h        # Shared types, enums, X-macro type lists
-│   │   ├── visualize.c/.h         # JNI object introspection (class name, toString)
-│   │   ├── vis_encode_typed_args.c # Argument → wire format encoding
-│   │   └── rangeset.c             # /proc/self/maps parser for caller filtering
+│   │   ├── visualize.c/.h         # JNI object introspection + typed-arg wire encoding
+│   │   └── rangeset.c             # dl_iterate_phdr-based caller-range filter
 │   └── go/                        # Go layer (rendering, config, types)
 │       ├── main.go                # Cgo callbacks, callFrame stack, bridge init
+│       ├── init.go                # Process init, package-name resolution
 │       ├── logger.go              # Colorized formatter, all emit_* functions
 │       ├── value.go               # JNIValue type system, decodeArgs, buildReturnValue
 │       ├── config.go              # JSON config parsing, cgo exports, call-key builder
 │       ├── signature.go           # JNI signature parser
-│       ├── init.go                # sync.Once guard, Go runtime readiness
 │       ├── rangeset.go            # Thin Go wrappers for C rangeset
-│       └── visualize.go           # Thin Go wrappers for C visualize functions
+│       ├── visualize.go           # Thin Go wrappers for C visualize functions
+│       ├── cbridge_all.c          # cgo aggregator that compiles src/cbridge/*.c
+│       ├── ndk_compat.h           # GCC-only shim so host gopls can parse NDK headers
+│       └── types_host.go          # !android mirror of formatter/decoder for host tests
 ├── docs/
-│   ├── CONFIG_SCHEMA.json         # JSON Schema for config file
-│   └── CALLKEY_FORMAT.md          # Full call-key reference for regex patterns
+│   └── CONFIG_SCHEMA.json         # JSON Schema for config file
 ├── xmake.lua                      # Build orchestration
 └── README.md
 ```
@@ -422,7 +440,7 @@ Some apps (especially games with anti-tamper like AppSealing, Jiagu, DexProtecto
 The library tries three mangled symbol names for `art::ArtField::GetName` across ART versions.  If none resolve, field names fall back to the method/field ID cache (populated when `GetFieldID`/`GetStaticFieldID` hooks fire).  Unresolved fields show `<unresolved>` in red.
 
 **Build fails with "conflicting types for config_function_*":**  
-You have a stale `_cgo_export.h` or `bridge.h` declaring cgo exports.  Delete the build directory and rebuild from scratch: `rm -rf .xmake build dist && xmake b jnilog_payload`.
+You have a stale `_cgo_export.h` or `bridge.h` declaring cgo exports.  Delete the build directory and rebuild from scratch: `rm -rf .xmake build dist && xmake b jnilog`.
 
 ---
 

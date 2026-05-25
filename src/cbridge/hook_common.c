@@ -16,11 +16,30 @@ static pthread_rwlock_t g_method_cache_lock = PTHREAD_RWLOCK_INITIALIZER;
 static field_sig_entry_t g_field_cache[METHOD_CACHE_SIZE];
 static pthread_rwlock_t g_field_cache_lock = PTHREAD_RWLOCK_INITIALIZER;
 
+/* g_in_hook has counter semantics rather than a plain 0/1 flag. Every
+ * `set_reentrant_call(1)` increments; every `set_reentrant_call(0)` decrements
+ * (saturating at zero). `is_reentrant_call()` reports true whenever the
+ * thread is inside ANY hook scope.
+ *
+ * Why a counter: vis_* helpers nest inside one another (e.g.
+ * vis_object_class_name → vis_class_name → CallObjectMethod), and each one
+ * brackets its own JNI sub-calls with set(1)/set(0). With plain 0/1 flag
+ * semantics, the inner helper's set(0) on exit would clear the flag for the
+ * still-active outer scope — and the next JNI call from the original code
+ * would re-enter the hooks as non-reentrant, recursing infinitely. The
+ * counter pattern lets `set(1)` / `set(0)` pairs nest correctly without
+ * touching the ~30 individual brackets across visualize.c / hooks.c. */
 static __thread int g_in_hook = 0;
 static __thread int g_jni_critical = 0;
 
-int is_reentrant_call(void) { return g_in_hook; }
-void set_reentrant_call(int val) { g_in_hook = val; }
+int is_reentrant_call(void) { return g_in_hook > 0; }
+void set_reentrant_call(int val) {
+  if (val) {
+    g_in_hook++;
+  } else if (g_in_hook > 0) {
+    g_in_hook--;
+  }
+}
 
 int is_jni_critical(void) { return g_jni_critical; }
 void set_jni_critical(int val) { g_jni_critical = val; }
@@ -238,6 +257,7 @@ typedef struct {
 } config_cache_entry_t;
 
 static config_cache_entry_t g_cfg_cache[CONFIG_CACHE_SIZE];
+static pthread_mutex_t      g_cfg_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static int                  g_cfg_cache_init = 0;
 
 static uint32_t cfg_hash(const char *s) {
@@ -247,6 +267,7 @@ static uint32_t cfg_hash(const char *s) {
 }
 
 static int cfg_lookup(const char *name, int *out) {
+  pthread_mutex_lock(&g_cfg_cache_lock);
   if (!g_cfg_cache_init) {
     memset(g_cfg_cache, 0, sizeof(g_cfg_cache));
     for (int i = 0; i < CONFIG_CACHE_SIZE; i++) g_cfg_cache[i].result = -1;
@@ -257,13 +278,22 @@ static int cfg_lookup(const char *name, int *out) {
     uint32_t idx = (hash + (uint32_t)i) & CONFIG_CACHE_MASK;
     config_cache_entry_t *e = &g_cfg_cache[idx];
     if (e->result == -1) {
-      if (config_function_blacklisted((char *)name)) { e->name = name; e->result = 0; *out = 0; return 1; }
-      if (!config_function_enabled((char *)name))  { e->name = name; e->result = 0; *out = 0; return 1; }
-      e->name = name; e->result = 1; *out = 1; return 1;
+      pthread_mutex_unlock(&g_cfg_cache_lock);
+      int allowed = 1;
+      if (config_function_blacklisted((char *)name)) allowed = 0;
+      else if (!config_function_enabled((char *)name)) allowed = 0;
+      pthread_mutex_lock(&g_cfg_cache_lock);
+      /* Re-check the slot — another thread may have populated it. */
+      if (e->result == -1) { e->name = name; e->result = allowed; }
+      *out = e->result;
+      pthread_mutex_unlock(&g_cfg_cache_lock);
+      return 1;
     }
-    if (e->name == name) { *out = e->result; return 1; }
-    if (e->name && strcmp(e->name, name) == 0) { e->name = name; *out = e->result; return 1; }
+    if (e->name == name) { *out = e->result; pthread_mutex_unlock(&g_cfg_cache_lock); return 1; }
+    if (e->name && strcmp(e->name, name) == 0) { e->name = name; *out = e->result; pthread_mutex_unlock(&g_cfg_cache_lock); return 1; }
   }
+  pthread_mutex_unlock(&g_cfg_cache_lock);
+  /* Cache full — fall back to direct Go-side query. */
   if (config_function_blacklisted((char *)name)) { *out = 0; return 1; }
   if (!config_function_enabled((char *)name))  { *out = 0; return 1; }
   *out = 1; return 1;

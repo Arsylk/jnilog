@@ -9,10 +9,28 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // ============================================================================
 // Types mirrored from android-tagged files for host-side testing.
+//
+// WARNING — DRIFT HAZARD:
+//
+// This file duplicates significant chunks of logger.go / value.go / config.go /
+// signature.go under the `!android` build tag so the test suite can compile
+// and run on the host without cgo. Every bug fix or behaviour change made to
+// the android-tagged formatters MUST be mirrored here, otherwise the tests
+// will pass against stale code and silently fail to catch regressions.
+//
+// Currently-mirrored behaviours (must stay in sync with logger.go):
+//   - rune-aware `truncate` (no UTF-8 mid-codepoint splits)
+//   - `escapeControlChars` applied at KindString rendering, formatObject's
+//     toString, and exception/throw `Extra` rendering paths
+//
+// Longer-term, the platform-independent formatter logic should be moved to
+// a non-tagged file and only the cgo bridge functions kept behind the
+// android build tag — but that's a focused refactor for another day.
 // ============================================================================
 
 // callFrame holds everything captured at the JNI call site.
@@ -39,7 +57,6 @@ type Config struct {
 	Categories []string    `json:"categories"`
 	Exclude    ExcludeRule `json:"exclude"`
 	ArrayItems int         `json:"array_items"`
-	StackDepth int         `json:"stack_depth"`
 
 	enabledSet   map[string]bool
 	blacklistSet map[string]bool
@@ -52,9 +69,7 @@ type Config struct {
 
 const (
 	ansiReset   = "\x1b[0m"
-	ansiBold    = "\x1b[1m"
 	ansiDim     = "\x1b[2m"
-	ansiItalic  = "\x1b[3m"
 	ansiRed     = "\x1b[31m"
 	ansiGreen   = "\x1b[32m"
 	ansiYellow  = "\x1b[33m"
@@ -62,7 +77,6 @@ const (
 	ansiMagenta = "\x1b[35m"
 	ansiCyan    = "\x1b[36m"
 	ansiGray    = "\x1b[90m"
-	ansiHidden  = "\x1b[8m"
 	// Extended palette
 	ansiDarkGray = "\x1b[30;2m"
 	ansiOrange   = "\x1b[38;2;250;179;135m"
@@ -70,10 +84,6 @@ const (
 	ansiPink     = "\x1b[38;2;245;194;231m"
 	ansiSubtle   = "\x1b[38;2;108;112;134m"
 	ansiMaroon   = "\x1b[38;2;235;160;172m"
-	// Modifier resets
-	ansiNoDim    = "\x1b[22m"
-	ansiNoBold   = "\x1b[22m"
-	ansiNoItalic = "\x1b[23m"
 )
 
 // ============================================================================
@@ -170,10 +180,13 @@ var categories = map[string][]string{
 // Config functions (mirrored from config.go)
 // ============================================================================
 
-var (
-	cfg   Config
-	cfgMu sync.RWMutex
-)
+// MUST match config.go: a single atomic.Pointer holding an immutable *Config.
+var cfg atomic.Pointer[Config]
+var emptyConfig = &Config{}
+
+func init() { cfg.Store(emptyConfig) }
+
+func loadCfg() *Config { return cfg.Load() }
 
 func buildEnabledSet(c *Config) {
 	if len(c.Functions) == 0 && len(c.Categories) == 0 {
@@ -216,12 +229,11 @@ func buildRegexList(c *Config) {
 }
 
 func configSignatureBlacklisted(key string) bool {
-	cfgMu.RLock()
-	defer cfgMu.RUnlock()
-	if cfg.regexList == nil {
+	c := loadCfg()
+	if c.regexList == nil {
 		return false
 	}
-	for _, re := range cfg.regexList {
+	for _, re := range c.regexList {
 		if re.MatchString(key) {
 			return true
 		}
@@ -229,24 +241,20 @@ func configSignatureBlacklisted(key string) bool {
 	return false
 }
 
-// config_function_blacklisted checks if a function name is in the blacklist.
 func configFunctionBlacklisted(name string) bool {
-	cfgMu.RLock()
-	defer cfgMu.RUnlock()
-	if cfg.blacklistSet == nil {
+	c := loadCfg()
+	if c.blacklistSet == nil {
 		return false
 	}
-	return cfg.blacklistSet[name]
+	return c.blacklistSet[name]
 }
 
-// config_function_enabled checks if a function name is in the whitelist.
 func configFunctionEnabled(name string) bool {
-	cfgMu.RLock()
-	defer cfgMu.RUnlock()
-	if cfg.enabledSet == nil {
+	c := loadCfg()
+	if c.enabledSet == nil {
 		return true
 	}
-	return cfg.enabledSet[name]
+	return c.enabledSet[name]
 }
 
 // ============================================================================
@@ -354,7 +362,13 @@ func popCallFrame(tid int) *callFrame {
 		return nil
 	}
 	frame := stack[len(stack)-1]
-	threadStacks[tid] = stack[:len(stack)-1]
+	// MUST match main.go: drop the map entry when the tid's stack reaches
+	// zero so transient host-test threads don't leak.
+	if len(stack) == 1 {
+		delete(threadStacks, tid)
+	} else {
+		threadStacks[tid] = stack[:len(stack)-1]
+	}
 	return frame
 }
 
@@ -373,12 +387,7 @@ func (f lineFormatter) colorize(color string, s string) string {
 	return color + s + ansiReset
 }
 
-func (f lineFormatter) bold(s string) string { return f.colorize(ansiBold, s) }
-func (f lineFormatter) dim(s string) string  { return f.colorize(ansiDim, s) }
-
-func (f lineFormatter) formatPrefix(name string, color string) string {
-	return "[" + f.colorize(color, name) + "]"
-}
+func (f lineFormatter) dim(s string) string { return f.colorize(ansiDim, s) }
 
 func (f lineFormatter) formatOffset(_ int) string { return "" }
 func (f lineFormatter) formatArrow() string       { return f.colorize(ansiBlue, "→") }
@@ -397,20 +406,20 @@ func (f lineFormatter) formatJNIValue(v JNIValue) string {
 		}
 		return f.colorize(ansiMagenta, "false")
 	case KindByte:
-		return f.colorize(ansiMagenta, fmt.Sprintf("0x%02x", uint8(v.Int)))
+		return f.colorize(ansiMagenta, byteHex(uint8(v.Int)))
 	case KindChar:
 		r := rune(uint16(v.Int))
 		if r >= 32 && r <= 126 && r != '\'' && r != '\\' {
-			return f.colorize(ansiYellow, fmt.Sprintf("'%c'", r))
+			return f.colorize(ansiYellow, "'"+string(r)+"'")
 		}
-		return f.colorize(ansiYellow, fmt.Sprintf("'\\u%04X'", r))
+		return f.colorize(ansiYellow, "'\\u"+u16Hex(uint16(v.Int))+"'")
 	case KindShort:
 		return f.colorize(ansiMagenta, strconv.FormatInt(v.Int, 10))
 	case KindInt:
 		n := int32(v.Int)
 		if n >= 0 && uint32(n) > 0xFFFF && uint32(n)&0xFFFF0000 != 0 {
-			return f.colorize(ansiMagenta, fmt.Sprintf("%d", n)) +
-				f.colorize(ansiGray, fmt.Sprintf(" /* 0x%08x */", uint32(n)))
+			return f.colorize(ansiMagenta, strconv.FormatInt(int64(n), 10)) +
+				f.colorize(ansiGray, " /* 0x"+u32Hex(uint32(n))+" */")
 		}
 		return f.colorize(ansiMagenta, strconv.FormatInt(int64(n), 10))
 	case KindLong:
@@ -423,11 +432,8 @@ func (f lineFormatter) formatJNIValue(v JNIValue) string {
 		s := strconv.FormatFloat(v.Float, 'g', -1, 64)
 		return f.colorize(ansiMagenta, s)
 	case KindString:
-		content := v.Str
-		if len(content) > 200 {
-			content = content[:200] + "…"
-		}
-		escaped := strings.NewReplacer(`"`, `\"`, "\n", `\n`, "\r", `\r`, "\t", `\t`).Replace(content)
+		content := truncate(v.Str, 200)
+		escaped := strings.ReplaceAll(escapeControlChars(content), `"`, `\"`)
 		return f.colorize(ansiYellow, `"`+escaped+`"`)
 	case KindClass:
 		return f.formatClassName(v.Str)
@@ -446,7 +452,7 @@ func (f lineFormatter) formatJNIValue(v JNIValue) string {
 		}
 		inner := strings.Join(parts, f.colorize(ansiGray, ", "))
 		if v.Int > 0 {
-			inner += f.colorize(ansiGray, fmt.Sprintf(" +%d more", v.Int))
+			inner += f.colorize(ansiGray, " +"+strconv.FormatInt(v.Int, 10)+" more")
 		}
 		return f.colorize(ansiBlue, "[") + inner + f.colorize(ansiBlue, "]")
 	case KindPointer:
@@ -477,15 +483,16 @@ func (f lineFormatter) formatObject(className, toString string) string {
 	if toString == "" || toString == className {
 		return f.formatClassName(className)
 	}
-	if strings.HasPrefix(toString, className) && len(toString) > len(className) && toString[len(className)] == '@' {
-		return f.formatClassName(className) + f.colorize(ansiGray, toString[len(className):])
+	safeToString := escapeControlChars(toString)
+	if strings.HasPrefix(safeToString, className) && len(safeToString) > len(className) && safeToString[len(className)] == '@' {
+		return f.formatClassName(className) + f.colorize(ansiGray, safeToString[len(className):])
 	}
-	if strings.Contains(strings.ToLower(toString), strings.ToLower(simpleName)) {
-		return f.highlightClassInString(toString, simpleName)
+	if strings.Contains(strings.ToLower(safeToString), strings.ToLower(simpleName)) {
+		return f.highlightClassInString(safeToString, simpleName)
 	}
 	return f.formatClassName(className) +
 		f.colorize(ansiBlue, `("`) +
-		f.colorize(ansiYellow, truncate(toString, 120)) +
+		f.colorize(ansiYellow, truncate(safeToString, 120)) +
 		f.colorize(ansiBlue, `")`)
 }
 
@@ -813,7 +820,7 @@ func emitExceptionEvent(offset int, frame *callFrame, result JNIValue) bool {
 			classStr := f.formatClassName(result.Str)
 			var msgStr string
 			if result.Extra != "" {
-				msgStr = " " + f.colorize(ansiYellow, `"`+result.Extra+`"`)
+				msgStr = " " + f.colorize(ansiYellow, `"`+escapeControlChars(result.Extra)+`"`)
 			}
 			writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s%s %s",
 				f.formatOffset(offset),
@@ -837,17 +844,19 @@ func emitExceptionEvent(offset int, frame *callFrame, result JNIValue) bool {
 			if arg0.Kind == KindObject || arg0.Kind == KindClass {
 				classStr = f.formatClassName(arg0.Str)
 				if arg0.Extra != "" {
-					msgStr = " " + f.colorize(ansiYellow, `"`+arg0.Extra+`"`)
+					msgStr = " " + f.colorize(ansiYellow, `"`+escapeControlChars(arg0.Extra)+`"`)
 				}
 			} else {
 				classStr = f.formatJNIValue(arg0)
 			}
 		}
-		// For ThrowNew, the second arg is the message string
+		// For ThrowNew, the second arg is the message string.
+		// MUST match logger.go — escapeControlChars guards against ANSI
+		// injection via attacker-controlled exception messages.
 		if frame.jniName == "ThrowNew" && len(frame.args) > 1 {
 			arg1 := frame.args[1]
 			if arg1.Kind == KindString {
-				msgStr = " " + f.colorize(ansiYellow, `"`+arg1.Str+`"`)
+				msgStr = " " + f.colorize(ansiYellow, `"`+escapeControlChars(arg1.Str)+`"`)
 			}
 		}
 		writeLine(logLevelInfo, fmt.Sprintf("%s%s %s%s %s",
@@ -1109,11 +1118,55 @@ func extractKV(s, key string) string {
 	return s[start : start+end]
 }
 
-func truncate(s string, max int) string {
-	if len(s) <= max {
+// truncate clips s to at most maxRunes Unicode code points, appending "…"
+// when truncation occurs. Operates on runes (not bytes) so multi-byte UTF-8
+// sequences never get split mid-rune. MUST match logger.go.
+func truncate(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return "…"
+	}
+	n := 0
+	for i := range s {
+		if n == maxRunes {
+			return s[:i] + "…"
+		}
+		n++
+	}
+	return s
+}
+
+// escapeControlChars replaces C0/C1 control bytes with visible escapes so an
+// untrusted Java string can't inject ANSI sequences. MUST match logger.go.
+func escapeControlChars(s string) string {
+	needs := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == 0x7f {
+			needs = true
+			break
+		}
+	}
+	if !needs {
 		return s
 	}
-	return s[:max] + "…"
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '\t':
+			b.WriteString(`\t`)
+		case c == '\n':
+			b.WriteString(`\n`)
+		case c == '\r':
+			b.WriteString(`\r`)
+		case c < 0x20 || c == 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // ============================================================================

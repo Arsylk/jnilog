@@ -175,10 +175,19 @@ typedef struct {
     int should_log;
     int logging_ready;
     int receiver_kind;        /* wire_kind_t cast to int */
-    const char *sig;          /* JNI descriptor string, from cache */
-    const char *method_name;  /* short name, from cache */
-    const char *clazz_name;   /* declaring class, from cache */
+    const char *sig;          /* JNI descriptor — points into sig_buf */
+    const char *method_name;  /* short name — points into method_name_buf */
+    const char *clazz_name;   /* declaring class — points into clazz_name_buf */
     char caller_str[192];
+    /* ctx-owned copies of the cache strings. The signature cache is rwlock-
+     * protected, but lookup_method_info releases the lock before returning
+     * raw pointers into the cache entries — a concurrent cache_method_signature
+     * writer can strncpy in-place over those buffers while the caller is still
+     * holding the pointer across vis_* sub-calls. We copy on lookup so the
+     * ctx outlives any later cache mutation on the same slot. */
+    char sig_buf[256];
+    char method_name_buf[128];
+    char clazz_name_buf[128];
     char *receiver_str;       /* heap: class name or string content */
     char *receiver_extra;     /* heap: toString() for KindObject */
     char *encoded_args;       /* heap: vis_encode_typed_args() output */
@@ -195,10 +204,17 @@ typedef struct {
     int should_log;
     int logging_ready;
     int receiver_kind;        /* wire_kind_t cast to int */
-    const char *sig;          /* field type descriptor, from cache */
-    const char *field_name;   /* field name, from cache */
-    const char *clazz_name;   /* declaring class, from cache */
+    const char *sig;          /* field type descriptor — points into sig_buf */
+    const char *field_name;   /* field name — points into field_name_buf */
+    const char *clazz_name;   /* declaring class — points into clazz_name_buf */
     char caller_str[192];
+    /* See method_log_ctx_t above for the rationale: lookup_field_info returns
+     * raw cache pointers (and a TLS pointer for art_get_field_name); the cache
+     * writer can rewrite those buffers in-place while the ctx still holds the
+     * pointer across vis_* sub-calls. Copy on lookup. */
+    char field_name_buf[128];
+    char sig_buf[256];
+    char clazz_name_buf[128];
     char *receiver_str;       /* heap: class name */
     char *receiver_extra;     /* heap: toString() */
 } field_log_ctx_t;
@@ -270,7 +286,6 @@ extern void goJNIFieldCallback(
 extern int config_function_blacklisted(char* name);
 extern int config_function_enabled(char* name);
 extern int config_array_max_items(void);
-extern int config_stack_depth(void);
 
 /* ============================================================================
  * Logging readiness — Go-side flag queried by C hooks.

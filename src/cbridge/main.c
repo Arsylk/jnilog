@@ -187,7 +187,16 @@ static void install_loader_dlopen_hook(void) {
             orig_loader_dlopen = (loader_dlopen_fn)*got_slot;
             void* page = (void*)((uintptr_t)got_slot & ~((uintptr_t)page_size - 1));
             real_mprotect(page, (size_t)page_size * 2, PROT_READ | PROT_WRITE);
-            *got_slot = (void*)hooked_loader_dlopen;
+            /* Use a release-store for the GOT slot. In stealth-injection mode
+             * the library constructor runs in a detached worker thread while
+             * the rest of the process is fully live (see library_constructor
+             * below); another thread could resolve and execute through this
+             * slot concurrently with the plain store, leading to a torn
+             * pointer dispatch. uintptr_t-typed __atomic_store is wait-free
+             * on aarch64 for the 8-byte-aligned GOT slot. */
+            __atomic_store_n((uintptr_t *)got_slot,
+                             (uintptr_t)(void*)hooked_loader_dlopen,
+                             __ATOMIC_RELEASE);
             real_mprotect(page, (size_t)page_size * 2, PROT_READ);
             LOG_DIRECT(ANDROID_LOG_INFO,
                        "install_loader_dlopen_hook: patched __loader_dlopen in libdl.so GOT (orig=%p)",
@@ -198,7 +207,9 @@ static void install_loader_dlopen_hook(void) {
             orig_loader_android_dlopen_ext = (loader_android_dlopen_ext_fn)*got_slot;
             void* page = (void*)((uintptr_t)got_slot & ~((uintptr_t)page_size - 1));
             real_mprotect(page, (size_t)page_size * 2, PROT_READ | PROT_WRITE);
-            *got_slot = (void*)hooked_loader_android_dlopen_ext;
+            __atomic_store_n((uintptr_t *)got_slot,
+                             (uintptr_t)(void*)hooked_loader_android_dlopen_ext,
+                             __ATOMIC_RELEASE);
             real_mprotect(page, (size_t)page_size * 2, PROT_READ);
             LOG_DIRECT(ANDROID_LOG_INFO,
                        "install_loader_dlopen_hook: patched __loader_android_dlopen_ext in libdl.so GOT (orig=%p)",
@@ -483,7 +494,12 @@ JNIEXPORT jint JNICALL JNI_GetCreatedJavaVMs(JavaVM** p_vm, jsize buf_len, jsize
     init_once_handler();
     if (!original_JNI_GetCreatedJavaVMs) return JNI_ERR;
     jint res = original_JNI_GetCreatedJavaVMs(p_vm, buf_len, n_vms);
-    if (res == JNI_OK && p_vm && *p_vm) try_install_hooks(*p_vm);
+    /* Only deref *p_vm when the underlying call actually wrote one — caller may
+     * legitimately pass buf_len=0 to probe the count, in which case *p_vm is
+     * uninitialized. */
+    if (res == JNI_OK && p_vm && buf_len > 0 && n_vms && *n_vms > 0 && *p_vm) {
+        try_install_hooks(*p_vm);
+    }
     return res;
 }
 

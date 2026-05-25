@@ -2,6 +2,29 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* ============================================================================
+ * Lifecycle invariant for `g_original_jni_table` access in this file.
+ *
+ * `install_jni_hooks()` populates `g_saved_jni_table` and sets
+ * `g_original_jni_table = &g_saved_jni_table` BEFORE any hooked entry replaces
+ * a slot in the live JNI table. Once the live table dispatches into a
+ * `hooked_*` function, `g_original_jni_table` is therefore guaranteed
+ * non-NULL. `restore_jni_hooks()` swaps the live table back to the original
+ * before the library unloads, so the hooked symbols are unreachable from
+ * Java after restore.
+ *
+ * Lookup hooks (FindClass / Get*MethodID / Get*FieldID / RegisterNatives) do
+ * still guard `g_original_jni_table->X` defensively because that path also
+ * needs `log_missing_original()` diagnostics when an exotic ART build leaves
+ * a slot NULL. The remaining hooks intentionally call through the slot
+ * unconditionally — on any well-formed ART build every slot is populated, and
+ * if a particular slot is genuinely NULL the resulting SIGSEGV pinpoints the
+ * missing function in the tombstone rather than silently producing wrong
+ * behaviour. This style inconsistency is intentional; new hooks should follow
+ * the lookup-hook pattern when adding a slot that callers may legitimately
+ * miss.
+ * ============================================================================ */
+
 #define PRIMITIVE_SIGCHAR_Boolean 'Z'
 #define PRIMITIVE_SIGCHAR_Byte    'B'
 #define PRIMITIVE_SIGCHAR_Char    'C'
@@ -73,7 +96,11 @@ static inline void _log_obj_arg_call(int slot, const char *name,
     }
     /* Encode single arg: sigChar \x01 val [\x03 extra] \x02
      * Use 'L' for object, 's' for string, 'c' for class (matches vis_encode_typed_args). */
-    char enc[1024] = "";
+    char enc[1024];
+    enc[0] = '\0';
+    /* Leave room for trailing \x02 + NUL — write-cap below uses cap-2. */
+    const int cap = (int)sizeof(enc);
+    const int max_payload = cap - 2;
     char sig_ch = (kind == WIRE_KIND_STRING) ? 's'
                 : (kind == WIRE_KIND_CLASS)  ? 'c'
                 : (kind == WIRE_KIND_NULL)   ? 'p'
@@ -82,19 +109,25 @@ static inline void _log_obj_arg_call(int slot, const char *name,
         snprintf(enc, sizeof(enc), "p\x01" "null\x02");
     } else {
         int pos = 0;
-        enc[pos++] = sig_ch; enc[pos++] = '\x01';
+        if (pos < max_payload) enc[pos++] = sig_ch;
+        if (pos < max_payload) enc[pos++] = '\x01';
         if (str) {
             int slen = (int)strlen(str);
-            if (slen > 900) slen = 900;
-            memcpy(enc + pos, str, slen); pos += slen;
+            int room = max_payload - pos;
+            if (room < 0) room = 0;
+            if (slen > room) slen = room;
+            if (slen > 0) { memcpy(enc + pos, str, (size_t)slen); pos += slen; }
         }
-        if (extra) {
+        if (extra && pos < max_payload) {
             enc[pos++] = '\x03';
             int elen = (int)strlen(extra);
-            if (elen > 900 - pos) elen = 900 - pos;
-            memcpy(enc + pos, extra, elen); pos += elen;
+            int room = max_payload - pos;
+            if (room < 0) room = 0;
+            if (elen > room) elen = room;
+            if (elen > 0) { memcpy(enc + pos, extra, (size_t)elen); pos += elen; }
         }
-        enc[pos++] = '\x02'; enc[pos] = '\0';
+        if (pos < cap - 1) enc[pos++] = '\x02';
+        enc[pos] = '\0';
     }
     log_jni_call(slot, name, WIRE_KIND_NULL, "", "", "", name, enc, 0, caller_str);
     free(str); free(extra);
@@ -106,12 +139,16 @@ static inline void _log_obj_arg_call(int slot, const char *name,
     set_reentrant_call(0); \
 } while(0)
 
-/* Two-object argument call (IsSameObject, etc.) */
+/* Two-object argument call (IsSameObject, etc.).
+ * Every write is bounded against `cap-1` (leaving one byte for the trailing
+ * NUL) so a long class name + toString from either object cannot overrun the
+ * stack buffer. */
 static inline void _log_obj2_arg_call(int slot, const char *name,
                                        JNIEnv *env, void *obj1, void *obj2,
                                        const char *caller_str) {
-    /* Build a two-record encoded_args string */
-    char enc[2048] = "";
+    char enc[2048];
+    enc[0] = '\0';
+    const int cap = (int)sizeof(enc);
     int pos = 0;
     void *objs[2] = {obj1, obj2};
     for (int i = 0; i < 2; i++) {
@@ -127,14 +164,30 @@ static inline void _log_obj2_arg_call(int slot, const char *name,
             sig_ch = 'L'; str = vis_object_class_name(env, o);
             extra = vis_object_tostring(env, o);
         }
-        enc[pos++] = sig_ch; enc[pos++] = '\x01';
+        if (pos < cap - 1) enc[pos++] = sig_ch;
+        if (pos < cap - 1) enc[pos++] = '\x01';
         if (!o) {
-            memcpy(enc+pos, "null", 4); pos += 4;
+            int room = cap - 1 - pos;
+            int n = room < 4 ? room : 4;
+            if (n > 0) { memcpy(enc+pos, "null", (size_t)n); pos += n; }
         } else {
-            if (str) { int n = (int)strlen(str); memcpy(enc+pos, str, n); pos += n; }
-            if (extra) { enc[pos++] = '\x03'; int n = (int)strlen(extra); memcpy(enc+pos, extra, n); pos += n; }
+            if (str) {
+                int n = (int)strlen(str);
+                int room = cap - 1 - pos;
+                if (room < 0) room = 0;
+                if (n > room) n = room;
+                if (n > 0) { memcpy(enc+pos, str, (size_t)n); pos += n; }
+            }
+            if (extra && pos < cap - 1) {
+                enc[pos++] = '\x03';
+                int n = (int)strlen(extra);
+                int room = cap - 1 - pos;
+                if (room < 0) room = 0;
+                if (n > room) n = room;
+                if (n > 0) { memcpy(enc+pos, extra, (size_t)n); pos += n; }
+            }
         }
-        enc[pos++] = '\x02';
+        if (pos < cap - 1) enc[pos++] = '\x02';
         free(str); free(extra);
     }
     enc[pos] = '\0';
@@ -383,15 +436,17 @@ static jint hooked_RegisterNatives(JNIEnv *env, jclass clazz,
       char *_items = vis_encode_array_items(env, array, PRIMITIVE_SIGCHAR(Name)); \
       size_t _ilen = _items ? strlen(_items) : 0;                               \
       char *enc = (char*)malloc(_ilen + 8);                                     \
-      enc[0] = '['; enc[1] = '\x01';                                            \
-      if (_items && _ilen > 0) memcpy(enc + 2, _items, _ilen);                 \
-      enc[2 + _ilen] = '\x02'; enc[3 + _ilen] = '\0';                          \
+      if (enc) {                                                                \
+        enc[0] = '['; enc[1] = '\x01';                                          \
+        if (_items && _ilen > 0) memcpy(enc + 2, _items, _ilen);                \
+        enc[2 + _ilen] = '\x02'; enc[3 + _ilen] = '\0';                         \
+        log_jni_call(JNI_SLOT(Get##Name##ArrayElements), "Get" #Name "ArrayElements", \
+                     WIRE_KIND_NULL, "", "", "", "Get" #Name "ArrayElements", enc, 0, cs); \
+        free(enc);                                                              \
+        log_jni_return(JNI_SLOT(Get##Name##ArrayElements), "Get" #Name "ArrayElements", \
+                       WIRE_KIND_POINTER, (uintptr_t)result, "", "");           \
+      }                                                                          \
       free(_items);                                                              \
-      log_jni_call(JNI_SLOT(Get##Name##ArrayElements), "Get" #Name "ArrayElements", \
-                   WIRE_KIND_NULL, "", "", "", "Get" #Name "ArrayElements", enc, 0, cs); \
-      free(enc);                                                                 \
-      log_jni_return(JNI_SLOT(Get##Name##ArrayElements), "Get" #Name "ArrayElements", \
-                     WIRE_KIND_POINTER, (uintptr_t)result, "", "");             \
       set_reentrant_call(0);                                                    \
     }                                                                           \
     return result;                                                              \
@@ -482,17 +537,19 @@ static jobject hooked_GetObjectArrayElement(JNIEnv *env, jobjectArray array, jsi
     /* Encode array as '[' arg + index as 'I' arg */
     size_t _alen = arr ? strlen(arr) : 0;
     char *enc = (char*)malloc(_alen + 32);
-    enc[0] = '['; enc[1] = '\x01';
-    if (arr && _alen > 0) memcpy(enc + 2, arr, _alen);
-    int _pos = 2 + (int)_alen;
-    enc[_pos++] = '\x02';
-    _pos += snprintf(enc + _pos, 24, "I\x01%d\x02", (int)index);
-    enc[_pos] = '\0';
+    if (enc) {
+      enc[0] = '['; enc[1] = '\x01';
+      if (arr && _alen > 0) memcpy(enc + 2, arr, _alen);
+      int _pos = 2 + (int)_alen;
+      enc[_pos++] = '\x02';
+      _pos += snprintf(enc + _pos, 24, "I\x01%d\x02", (int)index);
+      enc[_pos] = '\0';
+      log_jni_call(JNI_SLOT(GetObjectArrayElement), "GetObjectArrayElement",
+                   WIRE_KIND_NULL, "", "", "", "GetObjectArrayElement", enc, 0, cs);
+      free(enc);
+      _log_obj_ret(JNI_SLOT(GetObjectArrayElement), "GetObjectArrayElement", env, result);
+    }
     free(arr);
-    log_jni_call(JNI_SLOT(GetObjectArrayElement), "GetObjectArrayElement",
-                 WIRE_KIND_NULL, "", "", "", "GetObjectArrayElement", enc, 0, cs);
-    free(enc);
-    _log_obj_ret(JNI_SLOT(GetObjectArrayElement), "GetObjectArrayElement", env, result);
     set_reentrant_call(0);
   }
   return result;
@@ -517,40 +574,54 @@ static void hooked_SetObjectArrayElement(JNIEnv *env, jobjectArray array,
     set_reentrant_call(1);
     char cs[192]; address_of_r(caller, cs, sizeof(cs));
     char *arr = vis_encode_array_items(env, array, 'L');
-    /* Encode array as '[' arg, index as 'I' arg, then value */
+    /* Encode array as '[' arg, index as 'I' arg, then value.
+     * Worst-case writes: '[\x01' + arr + '\x02' + "I\x01<int>\x02" (~15) +
+     * "L\x01<200>\x03<200>\x02" (404) + NUL = arr + ~424. Allocate with a
+     * generous safety margin and clamp every snprintf return against the
+     * actual remaining capacity (snprintf returns would-have-written length,
+     * not actual; naive `_pos += snprintf(...)` over-counts on truncation). */
     size_t _alen = arr ? strlen(arr) : 0;
-    char *enc = (char*)malloc(_alen + 256);
+    size_t enc_cap = _alen + 512;
+    char *enc = (char*)malloc(enc_cap);
+    if (!enc) { free(arr); set_reentrant_call(0); return; }
     enc[0] = '['; enc[1] = '\x01';
     if (arr && _alen > 0) memcpy(enc + 2, arr, _alen);
     int _pos = 2 + (int)_alen;
     enc[_pos++] = '\x02';
-    _pos += snprintf(enc + _pos, 24, "I\x01%d\x02", (int)index);
+    /* Helper to append a snprintf result while clamping by remaining room. */
+#define ENC_APPEND(fmt, ...) do { \
+    int _room = (int)enc_cap - 1 - _pos; \
+    if (_room <= 0) break; \
+    int _w = snprintf(enc + _pos, (size_t)_room + 1, fmt, ##__VA_ARGS__); \
+    if (_w < 0) break; \
+    if (_w > _room) _w = _room; \
+    _pos += _w; \
+} while (0)
+    ENC_APPEND("I\x01%d\x02", (int)index);
     /* Encode the value being set — each record is self-delimiting via \x02 */
     if (!value) {
-      _pos += snprintf(enc + _pos, 8, "p\x01" "null\x02");
+      ENC_APPEND("p\x01" "null\x02");
     } else if (vis_is_string(env, value)) {
       char *sv = vis_string_value_raw(env, value);
-      _pos += snprintf(enc + _pos, _alen + 256 - _pos,
-                       "s\x01%.200s\x02", sv ? sv : "");
+      ENC_APPEND("s\x01%.200s\x02", sv ? sv : "");
       free(sv);
     } else if (vis_is_class(env, value)) {
       char *cn = vis_class_name(env, value);
-      _pos += snprintf(enc + _pos, _alen + 256 - _pos,
-                       "c\x01%.200s\x02", cn ? cn : "");
+      ENC_APPEND("c\x01%.200s\x02", cn ? cn : "");
       free(cn);
     } else {
       char *cn = vis_object_class_name(env, value);
       char *ts = vis_object_tostring(env, value);
-      _pos += snprintf(enc + _pos, _alen + 256 - _pos,
-                       "L\x01%.200s", cn ? cn : "");
+      ENC_APPEND("L\x01%.200s", cn ? cn : "");
       free(cn);
       if (ts) {
-        enc[_pos++] = '\x03';
-        _pos += snprintf(enc + _pos, _alen + 256 - _pos, "%.200s", ts);
+        if (_pos < (int)enc_cap - 1) enc[_pos++] = '\x03';
+        ENC_APPEND("%.200s", ts);
         free(ts);
       }
-      enc[_pos++] = '\x02';
+      if (_pos < (int)enc_cap - 1) enc[_pos++] = '\x02';
     }
+#undef ENC_APPEND
     enc[_pos] = '\0';
     free(arr);
     log_jni_call(JNI_SLOT(SetObjectArrayElement), "SetObjectArrayElement",
@@ -582,14 +653,16 @@ static jsize hooked_GetArrayLength(JNIEnv *env, jarray array) {
     char *_garr = vis_encode_array_items(env, array, _gsig);
     size_t _glen = _garr ? strlen(_garr) : 0;
     char *enc = (char*)malloc(_glen + 8);
-    enc[0] = '['; enc[1] = '\x01';
-    if (_garr && _glen > 0) memcpy(enc + 2, _garr, _glen);
-    enc[2 + _glen] = '\x02'; enc[3 + _glen] = '\0';
+    if (enc) {
+      enc[0] = '['; enc[1] = '\x01';
+      if (_garr && _glen > 0) memcpy(enc + 2, _garr, _glen);
+      enc[2 + _glen] = '\x02'; enc[3 + _glen] = '\0';
+      log_jni_call(JNI_SLOT(GetArrayLength), "GetArrayLength",
+                   WIRE_KIND_NULL, "", "", "", "GetArrayLength", enc, 0, cs);
+      free(enc);
+      LOG_INT_RET(GetArrayLength, "GetArrayLength", result);
+    }
     free(_garr);
-    log_jni_call(JNI_SLOT(GetArrayLength), "GetArrayLength",
-                 WIRE_KIND_NULL, "", "", "", "GetArrayLength", enc, 0, cs);
-    free(enc);
-    LOG_INT_RET(GetArrayLength, "GetArrayLength", result);
     set_reentrant_call(0);
   }
   return result;
@@ -928,14 +1001,18 @@ void hooked_Get##Name##ArrayRegion(JNIEnv *env, CType##Array array, jsize start,
     char *_ritems = vis_encode_ptr_array_items(buf, len, PRIMITIVE_SIGCHAR(Name)); \
     size_t _rilen = _ritems ? strlen(_ritems) : 0; \
     char *enc = (char*)malloc(_rilen + 48); \
-    int _rpos = snprintf(enc, 48, "I\x01%d\x02I\x01%d\x02[\x01", (int)start, (int)len); \
-    if (_ritems && _rilen > 0) memcpy(enc + _rpos, _ritems, _rilen); _rpos += (int)_rilen; \
-    enc[_rpos++] = '\x02'; enc[_rpos] = '\0'; \
+    if (enc) { \
+      int _rpos = snprintf(enc, 48, "I\x01%d\x02I\x01%d\x02[\x01", (int)start, (int)len); \
+      if (_rpos < 0) _rpos = 0; else if (_rpos > 47) _rpos = 47; \
+      if (_ritems && _rilen > 0) memcpy(enc + _rpos, _ritems, _rilen); \
+      _rpos += (int)_rilen; \
+      enc[_rpos++] = '\x02'; enc[_rpos] = '\0'; \
+      log_jni_call(JNI_SLOT(Get##Name##ArrayRegion), "Get" #Name "ArrayRegion", \
+                   WIRE_KIND_NULL, "", "", "", "Get" #Name "ArrayRegion", enc, 0, cs); \
+      free(enc); \
+      LOG_VOID_RET(Get##Name##ArrayRegion, "Get" #Name "ArrayRegion"); \
+    } \
     free(_ritems); \
-    log_jni_call(JNI_SLOT(Get##Name##ArrayRegion), "Get" #Name "ArrayRegion", \
-                 WIRE_KIND_NULL, "", "", "", "Get" #Name "ArrayRegion", enc, 0, cs); \
-    free(enc); \
-    LOG_VOID_RET(Get##Name##ArrayRegion, "Get" #Name "ArrayRegion"); \
     set_reentrant_call(0); \
   } \
 } \
@@ -947,14 +1024,18 @@ void hooked_Set##Name##ArrayRegion(JNIEnv *env, CType##Array array, jsize start,
     char *_sitems = vis_encode_ptr_array_items(buf, len, PRIMITIVE_SIGCHAR(Name)); \
     size_t _silen = _sitems ? strlen(_sitems) : 0; \
     char *enc = (char*)malloc(_silen + 48); \
-    int _spos = snprintf(enc, 48, "I\x01%d\x02I\x01%d\x02[\x01", (int)start, (int)len); \
-    if (_sitems && _silen > 0) memcpy(enc + _spos, _sitems, _silen); _spos += (int)_silen; \
-    enc[_spos++] = '\x02'; enc[_spos] = '\0'; \
+    if (enc) { \
+      int _spos = snprintf(enc, 48, "I\x01%d\x02I\x01%d\x02[\x01", (int)start, (int)len); \
+      if (_spos < 0) _spos = 0; else if (_spos > 47) _spos = 47; \
+      if (_sitems && _silen > 0) memcpy(enc + _spos, _sitems, _silen); \
+      _spos += (int)_silen; \
+      enc[_spos++] = '\x02'; enc[_spos] = '\0'; \
+      log_jni_call(JNI_SLOT(Set##Name##ArrayRegion), "Set" #Name "ArrayRegion", \
+                   WIRE_KIND_NULL, "", "", "", "Set" #Name "ArrayRegion", enc, 0, cs); \
+      free(enc); \
+      LOG_VOID_RET(Set##Name##ArrayRegion, "Set" #Name "ArrayRegion"); \
+    } \
     free(_sitems); \
-    log_jni_call(JNI_SLOT(Set##Name##ArrayRegion), "Set" #Name "ArrayRegion", \
-                 WIRE_KIND_NULL, "", "", "", "Set" #Name "ArrayRegion", enc, 0, cs); \
-    free(enc); \
-    LOG_VOID_RET(Set##Name##ArrayRegion, "Set" #Name "ArrayRegion"); \
     set_reentrant_call(0); \
   } \
   g_original_jni_table->Set##Name##ArrayRegion(env, array, start, len, buf); \
@@ -980,7 +1061,7 @@ jint hooked_ThrowNew(JNIEnv *env, jclass clazz, const char *msg) {
     char cs[192]; address_of_r(caller, cs, sizeof(cs));
     char *cn = vis_class_name(env, clazz);
     char enc[1024];
-    snprintf(enc, sizeof(enc), "c\x01%s\x02s\x01%.400s\x02", cn ? cn : "", msg ? msg : "");
+    snprintf(enc, sizeof(enc), "c\x01%.500s\x02s\x01%.400s\x02", cn ? cn : "", msg ? msg : "");
     free(cn);
     log_jni_call(JNI_SLOT(ThrowNew), "ThrowNew",
                  WIRE_KIND_NULL, "", "", "", "ThrowNew", enc, 0, cs);
@@ -1004,6 +1085,14 @@ jthrowable hooked_ExceptionOccurred(JNIEnv *env) {
                  WIRE_KIND_NULL, "", "", "", "ExceptionOccurred", "", 0, cs);
     _log_obj_ret(JNI_SLOT(ExceptionOccurred), "ExceptionOccurred", env, res);
 
+    /* _log_obj_ret runs vis_* helpers which may themselves throw (OOM during
+     * GetMethodID, etc.). If a secondary exception is now pending, our
+     * Throw(res) below would silently overwrite it. Clear so the original
+     * exception we re-throw is the one the caller's ExceptionOccurred peek
+     * actually saw. */
+    if (g_original_jni_table->ExceptionCheck(env)) {
+      g_original_jni_table->ExceptionClear(env);
+    }
     /* Re-throw — ExceptionOccurred is a peek, not a clear/consume */
     g_original_jni_table->Throw(env, res);
     set_reentrant_call(0);
@@ -1022,15 +1111,21 @@ void hooked_ExceptionClear(JNIEnv *env) {
   void *caller = __builtin_return_address(0);
   int should_log = !is_reentrant_call() && should_log_from_caller(env, caller);
   if (should_log) {
-    /* Before clearing, peek at what exception exists so we can show it. */
+    /* Peek at the pending exception, then ACTUALLY clear it before resolving
+     * vis_* helpers — they all bail via vis_safe_to_call while an exception
+     * is pending, so the previous code resolved nothing and always logged
+     * an empty class name + empty toString. Since the user asked to clear,
+     * we don't need to re-throw afterward. */
     set_reentrant_call(1);
     char cs[192]; address_of_r(caller, cs, sizeof(cs));
     jthrowable exc = g_original_jni_table->ExceptionOccurred(env);
     if (exc) {
+      g_original_jni_table->ExceptionClear(env);
       char *cn = vis_object_class_name(env, exc);
       char *ts = vis_object_tostring(env, exc);
       char enc[1024];
       int pos = 0;
+      const int cap = (int)sizeof(enc);
       if (vis_is_string(env, exc)) {
         char *sv = vis_string_value_raw(env, exc);
         pos = snprintf(enc, sizeof(enc), "s\x01%.400s", sv ? sv : "");
@@ -1038,8 +1133,19 @@ void hooked_ExceptionClear(JNIEnv *env) {
       } else {
         pos = snprintf(enc, sizeof(enc), "L\x01%.400s", cn ? cn : "");
       }
-      if (ts) { enc[pos++] = '\x03'; snprintf(enc + pos, sizeof(enc) - pos, "%.400s", ts); }
-      enc[sizeof(enc)-1] = '\0';
+      if (pos < 0) pos = 0;
+      if (pos > cap - 1) pos = cap - 1;
+      if (ts && pos < cap - 2) {
+        enc[pos++] = '\x03';
+        int w = snprintf(enc + pos, (size_t)(cap - 1 - pos), "%.400s", ts);
+        if (w < 0) w = 0;
+        if (w > cap - 1 - pos) w = cap - 1 - pos;
+        pos += w;
+      }
+      /* Wire records terminate with \x02 — earlier code omitted this on the
+       * toString branch, so the Go decoder would mis-parse the trailing field. */
+      if (pos < cap - 1) enc[pos++] = '\x02';
+      enc[pos] = '\0';
       free(cn); free(ts);
       log_jni_call(JNI_SLOT(ExceptionClear), "ExceptionClear",
                    WIRE_KIND_NULL, "", "", "", "ExceptionClear", enc, 0, cs);
@@ -1050,8 +1156,10 @@ void hooked_ExceptionClear(JNIEnv *env) {
     }
     LOG_VOID_RET(ExceptionClear, "ExceptionClear");
     set_reentrant_call(0);
+  } else {
+    /* Not logging — defer to the original which clears as expected. */
+    g_original_jni_table->ExceptionClear(env);
   }
-  g_original_jni_table->ExceptionClear(env);
 }
 void hooked_FatalError(JNIEnv *env, const char *msg) {
   void *caller = __builtin_return_address(0);
@@ -1114,7 +1222,7 @@ jclass hooked_DefineClass(JNIEnv *env, const char *name, jobject loader, const j
   jclass res = g_original_jni_table->DefineClass(env, name, loader, buf, bufLen);
   if (!is_reentrant_call() && should_log_from_caller(env, caller)) {
     char cs[192]; address_of_r(caller, cs, sizeof(cs));
-    char enc[256]; snprintf(enc, sizeof(enc), "c\x01%s\x02I\x01%d\x02",
+    char enc[256]; snprintf(enc, sizeof(enc), "c\x01%.200s\x02I\x01%d\x02",
                              name ? name : "", (int)bufLen);
     log_jni_call(JNI_SLOT(DefineClass), "DefineClass",
                  WIRE_KIND_NULL, "", "", "", "DefineClass", enc, 0, cs);

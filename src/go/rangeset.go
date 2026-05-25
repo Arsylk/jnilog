@@ -3,7 +3,7 @@
 package main
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../cbridge -I${SRCDIR}/../shared
+#cgo CFLAGS: -I${SRCDIR}/../cbridge
 #cgo LDFLAGS: -ldl -llog
 #include <stdlib.h>
 */

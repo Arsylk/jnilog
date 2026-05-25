@@ -3,7 +3,7 @@
 package main
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../cbridge -I${SRCDIR}/../shared -include ${SRCDIR}/ndk_compat.h
+#cgo CFLAGS: -I${SRCDIR}/../cbridge -include ${SRCDIR}/ndk_compat.h
 #cgo LDFLAGS: -ldl
 #include <stdint.h>
 #include <stdlib.h>
@@ -45,6 +45,7 @@ import "C"
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -108,7 +109,15 @@ func popCallFrame(tid int) *callFrame {
 		return nil
 	}
 	frame := stack[len(stack)-1]
-	threadStacks[tid] = stack[:len(stack)-1]
+	// Drop the map entry when the tid's stack reaches zero so transient Java
+	// worker threads don't leak into threadStacks forever (Android pools and
+	// reuses tids, but a short-lived thread that never returns to balance
+	// would otherwise pin its slot indefinitely).
+	if len(stack) == 1 {
+		delete(threadStacks, tid)
+	} else {
+		threadStacks[tid] = stack[:len(stack)-1]
+	}
 	return frame
 }
 
@@ -116,7 +125,7 @@ func popCallFrame(tid int) *callFrame {
 //
 //export goJNICallCallback
 func goJNICallCallback(
-	offset C.int,
+	_ C.int, // offset — reserved; emitCallFull uses formatOffset which is a no-op
 	jniName *C.char,
 	receiverKind C.int,
 	receiverStr *C.char,
@@ -233,24 +242,19 @@ func goLogNativeError(message *C.char) {
 	goLogNative(6, message) // kLogPriorityError
 }
 
-var (
-	loggingReadyMu sync.RWMutex
-	loggingReady   bool
-)
+// loggingReady is the hottest gate in the system — every C log entry point
+// queries it once. An atomic.Bool load is a single-instruction acquire vs.
+// the RWMutex round-trip that lived here previously.
+var loggingReady atomic.Bool
 
 //export goSetLoggingReady
 func goSetLoggingReady(ready C.int) {
-	loggingReadyMu.Lock()
-	loggingReady = ready != 0
-	loggingReadyMu.Unlock()
+	loggingReady.Store(ready != 0)
 }
 
 //export goGetLoggingReady
 func goGetLoggingReady() C.int {
-	loggingReadyMu.RLock()
-	ready := loggingReady
-	loggingReadyMu.RUnlock()
-	if ready {
+	if loggingReady.Load() {
 		return 1
 	}
 	return 0

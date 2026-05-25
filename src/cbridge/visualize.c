@@ -82,10 +82,25 @@ char* vis_class_name(JNIEnv* env, void* clazz_ptr) {
     set_reentrant_call(1);
     jclass clazz = (jclass)clazz_ptr;
     jclass cc = g_original_jni_table->GetObjectClass(env, clazz);
+    /* GetObjectClass can return NULL on OOM or with a stale jclass; sibling
+     * helpers (vis_object_class_name / vis_object_tostring_safe) check; this
+     * one previously did not and would SIGSEGV inside GetMethodID. */
+    if (!cc) {
+        if (g_original_jni_table->ExceptionCheck(env)) g_original_jni_table->ExceptionClear(env);
+        set_reentrant_call(0);
+        return NULL;
+    }
     jmethodID mid = g_original_jni_table->GetMethodID(env, cc, "getName", "()Ljava/lang/String;");
     char* res = NULL;
     if (mid) {
         jstring ns = (jstring)g_original_jni_table->CallObjectMethod(env, clazz, mid);
+        /* Defensive: an overridden Class.getName() that throws would otherwise
+         * leak its pending exception back into the target's flow when the
+         * logger returns. Clear unconditionally — we already failed to read
+         * the name; the caller can't recover the value either way. */
+        if (g_original_jni_table->ExceptionCheck(env)) {
+            g_original_jni_table->ExceptionClear(env);
+        }
         if (ns) {
             const char* c = g_original_jni_table->GetStringUTFChars(env, ns, NULL);
             if (c) { res = strdup(c); g_original_jni_table->ReleaseStringUTFChars(env, ns, c); }
@@ -185,8 +200,11 @@ char* vis_string_value(JNIEnv* env, void* str_ptr) {
     const char* c = g_original_jni_table->GetStringUTFChars(env, s, NULL);
     char* res = NULL;
     if (c) {
-        res = (char*)malloc(strlen(c) + 3);
-        sprintf(res, "\"%s\"", c);
+        size_t need = strlen(c) + 3; /* "" + content + NUL */
+        res = (char*)malloc(need);
+        if (res) {
+            (void)snprintf(res, need, "\"%s\"", c);
+        }
         g_original_jni_table->ReleaseStringUTFChars(env, s, c);
     }
     set_reentrant_call(0);
@@ -224,11 +242,19 @@ char* vis_string_value_raw(JNIEnv* env, void* str_ptr) {
 #define VIS_MAX_ARRAY_ITEMS 16
  
 
-/* Grow-buffer helpers (mirrors vis_encode_typed_args.c) */
+/* Grow-buffer helpers (mirrors vis_encode_typed_args.c).
+ * On realloc failure, frees the previous buffer and returns NULL — callers
+ * must propagate NULL to their own caller. The VEA_* macros below propagate
+ * automatically: they overwrite the buffer variable, and append-after-NULL
+ * remains NULL because the early-return inside vea_append takes that path. */
 static char *vea_append(char *buf, size_t *len, size_t *cap, const char *src, size_t n) {
+    if (buf == NULL) return NULL;
     while (*len + n + 1 > *cap) {
-        *cap = (*cap < 128) ? 256 : (*cap * 2);
-        buf = (char*)realloc(buf, *cap);
+        size_t new_cap = (*cap < 128) ? 256 : (*cap * 2);
+        char *new_buf = (char*)realloc(buf, new_cap);
+        if (new_buf == NULL) { free(buf); return NULL; }
+        buf = new_buf;
+        *cap = new_cap;
     }
     memcpy(buf + *len, src, n);
     *len += n;
@@ -236,7 +262,7 @@ static char *vea_append(char *buf, size_t *len, size_t *cap, const char *src, si
     return buf;
 }
 #define VEA_LIT(b, l, c, s) vea_append(b, l, c, s, strlen(s))
-#define VEA_CH(b, l, c, ch) do { char _c = (ch); b = vea_append(b, l, c, &_c, 1); } while(0)
+#define VEA_CH(b, l, c, ch) do { if (b) { char _c = (ch); b = vea_append(b, l, c, &_c, 1); } } while(0)
 
 char* vis_encode_array_items(JNIEnv* env, void* arr, char itemSigChar) {
     if (arr == NULL || !vis_safe_to_call(env)) return strdup("");
@@ -356,6 +382,16 @@ char* vis_encode_array_items(JNIEnv* env, void* arr, char itemSigChar) {
         for (jsize i = 0; i < count; i++) {
             set_reentrant_call(0);
             jobject elem = g_original_jni_table->GetObjectArrayElement(env, (jobjectArray)arr, i);
+            /* GetObjectArrayElement can throw ArrayIndexOutOfBoundsException
+             * (e.g. if the array was concurrently mutated). Clear here so the
+             * rest of the loop's vis_* helpers don't all no-op via
+             * vis_safe_to_call, and so the exception doesn't propagate back
+             * into the target's flow when the encoder returns. */
+            if (g_original_jni_table->ExceptionCheck(env)) {
+                g_original_jni_table->ExceptionClear(env);
+                set_reentrant_call(1);
+                break;
+            }
             VEA_CH(buf, &len, &cap, '\x04');
             if (!elem) {
                 buf = VEA_LIT(buf, &len, &cap, "null");
@@ -438,16 +474,71 @@ char* vis_encode_ptr_array_items(const void* buf, jsize count, char itemSigChar)
     return out;
 }
 
+/* Advance `*ps` past one JNI type descriptor (L…;, [..., or a primitive char).
+ * Returns 0 on success, -1 if the descriptor is malformed (e.g. an L without
+ * a terminating semicolon). Caller bails out of arg extraction on -1 so a
+ * cached bad signature can't crash the hot path. */
+static int sig_advance_one(const char** ps) {
+    const char* s = *ps;
+    if (*s == 'L') {
+        const char* end = strchr(s, ';');
+        if (!end) return -1;
+        *ps = end + 1;
+        return 0;
+    }
+    if (*s == '[') {
+        while (*s == '[') s++;
+        if (*s == 'L') {
+            const char* end = strchr(s, ';');
+            if (!end) return -1;
+            *ps = end + 1;
+        } else if (*s == '\0') {
+            return -1;
+        } else {
+            *ps = s + 1;
+        }
+        return 0;
+    }
+    *ps = s + 1;
+    return 0;
+}
+
 int extract_va_args(const char* sig, va_list ap, uintptr_t* out, int max) {
     if (!sig || sig[0] != '(') return 0;
     const char* s = sig + 1; int n = 0;
     while (*s != ')' && *s != '\0' && n < max) {
-        if (*s == 'L' || *s == '[') { out[n++] = (uintptr_t)va_arg(ap, jobject); if (*s == 'L') s = strchr(s, ';') + 1; else { while (*s == '[') s++; if (*s == 'L') s = strchr(s, ';') + 1; else s++; } }
-        else switch (*s++) {
-            case 'Z': case 'B': case 'C': case 'S': case 'I': out[n++] = (uintptr_t)va_arg(ap, jint); break;
-            case 'J': out[n++] = (uintptr_t)va_arg(ap, jlong); break;
-            case 'F': { double f = va_arg(ap, double); float fl = (float)f; out[n++] = *((uintptr_t*)&fl); break; }
-            case 'D': { double d = va_arg(ap, double); out[n++] = *((uintptr_t*)&d); break; }
+        if (*s == 'L' || *s == '[') {
+            out[n++] = (uintptr_t)va_arg(ap, jobject);
+            if (sig_advance_one(&s) != 0) break;
+        } else {
+            char k = *s;
+            if (sig_advance_one(&s) != 0) break;
+            switch (k) {
+                case 'Z': case 'B': case 'C': case 'S': case 'I':
+                    out[n++] = (uintptr_t)va_arg(ap, jint); break;
+                case 'J':
+                    out[n++] = (uintptr_t)va_arg(ap, jlong); break;
+                case 'F': {
+                    /* float is promoted to double through va_arg; pack the
+                     * 4 single-precision bytes into the low half of uintptr_t. */
+                    double f = va_arg(ap, double);
+                    float fl = (float)f;
+                    uint32_t bits;
+                    memcpy(&bits, &fl, sizeof(bits));
+                    out[n++] = (uintptr_t)bits;
+                    break;
+                }
+                case 'D': {
+                    double d = va_arg(ap, double);
+                    uintptr_t bits = 0;
+                    memcpy(&bits, &d, sizeof(d) < sizeof(bits) ? sizeof(d) : sizeof(bits));
+                    out[n++] = bits;
+                    break;
+                }
+                default:
+                    /* Unknown type char — bail rather than misalign va_list. */
+                    return n;
+            }
         }
     }
     return n;
@@ -457,16 +548,34 @@ int extract_jvalue_args(const char* sig, const jvalue* args, uintptr_t* out, int
     if (!sig || sig[0] != '(' || !args) return 0;
     const char* s = sig + 1; int n = 0;
     while (*s != ')' && *s != '\0' && n < max) {
-        if (*s == 'L' || *s == '[') { out[n] = (uintptr_t)args[n].l; n++; if (*s == 'L') s = strchr(s, ';') + 1; else { while (*s == '[') s++; if (*s == 'L') s = strchr(s, ';') + 1; else s++; } }
-        else switch (*s++) {
-            case 'Z': out[n] = (uintptr_t)args[n].z; n++; break;
-            case 'B': out[n] = (uintptr_t)args[n].b; n++; break;
-            case 'C': out[n] = (uintptr_t)args[n].c; n++; break;
-            case 'S': out[n] = (uintptr_t)args[n].s; n++; break;
-            case 'I': out[n] = (uintptr_t)args[n].i; n++; break;
-            case 'J': out[n] = (uintptr_t)args[n].j; n++; break;
-            case 'F': out[n] = *((uintptr_t*)&args[n].f); n++; break;
-            case 'D': out[n] = *((uintptr_t*)&args[n].d); n++; break;
+        if (*s == 'L' || *s == '[') {
+            out[n] = (uintptr_t)args[n].l; n++;
+            if (sig_advance_one(&s) != 0) break;
+        } else {
+            char k = *s;
+            if (sig_advance_one(&s) != 0) break;
+            switch (k) {
+                case 'Z': out[n] = (uintptr_t)args[n].z; n++; break;
+                case 'B': out[n] = (uintptr_t)args[n].b; n++; break;
+                case 'C': out[n] = (uintptr_t)args[n].c; n++; break;
+                case 'S': out[n] = (uintptr_t)args[n].s; n++; break;
+                case 'I': out[n] = (uintptr_t)args[n].i; n++; break;
+                case 'J': out[n] = (uintptr_t)args[n].j; n++; break;
+                case 'F': {
+                    uint32_t bits;
+                    memcpy(&bits, &args[n].f, sizeof(bits));
+                    out[n++] = (uintptr_t)bits;
+                    break;
+                }
+                case 'D': {
+                    uintptr_t bits = 0;
+                    memcpy(&bits, &args[n].d, sizeof(args[n].d) < sizeof(bits) ? sizeof(args[n].d) : sizeof(bits));
+                    out[n++] = bits;
+                    break;
+                }
+                default:
+                    return n;
+            }
         }
     }
     return n;
@@ -555,11 +664,14 @@ char* vis_encode_typed_args(JNIEnv *env, const char *sig, uintptr_t *extracted, 
             if (val == 0 || !env) break;
             void *obj = (void *)val;
             if (vis_is_string(env, obj)) {
-                buf[len - 2] = 's';
+                /* Patch the just-appended 'L' sigChar to 's' (string). If the
+                 * earlier VEA_CH calls hit a realloc failure, buf is NULL and
+                 * len was not advanced — guard the in-place rewrite. */
+                if (buf && len >= 2) buf[len - 2] = 's';
                 char *sv = vis_string_value_raw(env, obj);
                 if (sv) { buf = vea_append(buf, &len, &cap, sv, strlen(sv)); free(sv); }
             } else if (vis_is_class(env, obj)) {
-                buf[len - 2] = 'c';
+                if (buf && len >= 2) buf[len - 2] = 'c';
                 char *cn = vis_class_name(env, obj);
                 if (cn) { buf = vea_append(buf, &len, &cap, cn, strlen(cn)); free(cn); }
             } else {

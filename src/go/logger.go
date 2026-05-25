@@ -12,9 +12,7 @@ import (
 
 const (
 	ansiReset   = "\x1b[0m"
-	ansiBold    = "\x1b[1m"
 	ansiDim     = "\x1b[2m"
-	ansiItalic  = "\x1b[3m"
 	ansiRed     = "\x1b[31m"
 	ansiGreen   = "\x1b[32m"
 	ansiYellow  = "\x1b[33m"
@@ -22,7 +20,6 @@ const (
 	ansiMagenta = "\x1b[35m"
 	ansiCyan    = "\x1b[36m"
 	ansiGray    = "\x1b[90m"
-	ansiHidden  = "\x1b[8m"
 	// Extended palette
 	ansiDarkGray = "\x1b[30;2m"
 	ansiOrange   = "\x1b[38;2;250;179;135m"
@@ -30,10 +27,6 @@ const (
 	ansiPink     = "\x1b[38;2;245;194;231m"
 	ansiSubtle   = "\x1b[38;2;108;112;134m"
 	ansiMaroon   = "\x1b[38;2;235;160;172m"
-	// Modifier resets
-	ansiNoDim    = "\x1b[22m"
-	ansiNoBold   = "\x1b[22m"
-	ansiNoItalic = "\x1b[23m"
 )
 
 // ============================================================================
@@ -140,12 +133,7 @@ func (f lineFormatter) colorize(color string, s string) string {
 	return color + s + ansiReset
 }
 
-func (f lineFormatter) bold(s string) string { return f.colorize(ansiBold, s) }
-func (f lineFormatter) dim(s string) string  { return f.colorize(ansiDim, s) }
-
-func (f lineFormatter) formatPrefix(name string, color string) string {
-	return "[" + f.colorize(color, name) + "]"
-}
+func (f lineFormatter) dim(s string) string { return f.colorize(ansiDim, s) }
 
 func (f lineFormatter) formatLogcatPrefix(name string, color string) string {
 	return "[" + color + name + ansiReset + "]"
@@ -184,16 +172,16 @@ func (f lineFormatter) formatJNIValue(v JNIValue) string {
 	// ── Byte ─────────────────────────────────────────────────────────────────
 	// Always hex; two digits — matches how bytecode tools show bytes
 	case KindByte:
-		return f.colorize(ansiMagenta, fmt.Sprintf("0x%02x", uint8(v.Int)))
+		return f.colorize(ansiMagenta, byteHex(uint8(v.Int)))
 
 	// ── Char ─────────────────────────────────────────────────────────────────
 	// Printable ASCII → 'x', otherwise \uXXXX — yellow like string content
 	case KindChar:
 		r := rune(uint16(v.Int))
 		if r >= 32 && r <= 126 && r != '\'' && r != '\\' {
-			return f.colorize(ansiYellow, fmt.Sprintf("'%c'", r))
+			return f.colorize(ansiYellow, "'"+string(r)+"'")
 		}
-		return f.colorize(ansiYellow, fmt.Sprintf("'\\u%04X'", r))
+		return f.colorize(ansiYellow, "'\\u"+u16Hex(uint16(v.Int))+"'")
 
 	// ── Short ────────────────────────────────────────────────────────────────
 	case KindShort:
@@ -205,8 +193,8 @@ func (f lineFormatter) formatJNIValue(v JNIValue) string {
 	case KindInt:
 		n := int32(v.Int)
 		if n >= 0 && uint32(n) > 0xFFFF && uint32(n)&0xFFFF0000 != 0 {
-			return f.colorize(ansiMagenta, fmt.Sprintf("%d", n)) +
-				f.colorize(ansiGray, fmt.Sprintf(" /* 0x%08x */", uint32(n)))
+			return f.colorize(ansiMagenta, strconv.FormatInt(int64(n), 10)) +
+				f.colorize(ansiGray, " /* 0x"+u32Hex(uint32(n))+" */")
 		}
 		return f.colorize(ansiMagenta, strconv.FormatInt(int64(n), 10))
 
@@ -230,11 +218,11 @@ func (f lineFormatter) formatJNIValue(v JNIValue) string {
 	// ── Java String ──────────────────────────────────────────────────────────
 	// Always quoted yellow — never confused with a class name or number
 	case KindString:
-		content := v.Str
-		if len(content) > 200 {
-			content = content[:200] + "…"
-		}
-		escaped := strings.NewReplacer(`"`, `\"`, "\n", `\n`, "\r", `\r`, "\t", `\t`).Replace(content)
+		content := truncate(v.Str, 200)
+		// escapeControlChars handles \t \n \r and every other C0/C1 byte so a
+		// malicious Java string can't inject ANSI escapes; then quote-escape "
+		// for visual clarity within the yellow-quoted display.
+		escaped := strings.ReplaceAll(escapeControlChars(content), `"`, `\"`)
 		return f.colorize(ansiYellow, `"`+escaped+`"`)
 
 	// ── jclass ───────────────────────────────────────────────────────────────
@@ -262,7 +250,7 @@ func (f lineFormatter) formatJNIValue(v JNIValue) string {
 		}
 		inner := strings.Join(parts, f.colorize(ansiGray, ", "))
 		if v.Int > 0 {
-			inner += f.colorize(ansiGray, fmt.Sprintf(" +%d more", v.Int))
+			inner += f.colorize(ansiGray, " +"+strconv.FormatInt(v.Int, 10)+" more")
 		}
 		return f.colorize(ansiBlue, "[") + inner + f.colorize(ansiBlue, "]")
 
@@ -300,19 +288,23 @@ func (f lineFormatter) formatObject(className, toString string) string {
 	if toString == "" || toString == className {
 		return f.formatClassName(className)
 	}
+	// Sanitize untrusted toString output before any rendering decision —
+	// `toString` flows directly into ANSI-colorized output, so a malicious
+	// implementation could otherwise inject terminal escape sequences.
+	safeToString := escapeControlChars(toString)
 	// Standard Java identity toString: ClassName@hexhash — render uniformly
-	if strings.HasPrefix(toString, className) && len(toString) > len(className) && toString[len(className)] == '@' {
-		return f.formatClassName(className) + f.colorize(ansiGray, toString[len(className):])
+	if strings.HasPrefix(safeToString, className) && len(safeToString) > len(className) && safeToString[len(className)] == '@' {
+		return f.formatClassName(className) + f.colorize(ansiGray, safeToString[len(className):])
 	}
-	if strings.Contains(strings.ToLower(toString), strings.ToLower(simpleName)) {
+	if strings.Contains(strings.ToLower(safeToString), strings.ToLower(simpleName)) {
 		// toString carries class context — highlight the class portion within it
-		return f.highlightClassInString(toString, simpleName)
+		return f.highlightClassInString(safeToString, simpleName)
 	}
 
 	// Generic: ClassName("toString content")
 	return f.formatClassName(className) +
 		f.colorize(ansiBlue, `("`) +
-		f.colorize(ansiYellow, truncate(toString, 120)) +
+		f.colorize(ansiYellow, truncate(safeToString, 120)) +
 		f.colorize(ansiBlue, `")`)
 }
 
@@ -345,19 +337,6 @@ func (f lineFormatter) formatBundle(s string) string {
 	}
 	res += f.colorize(ansiBlue, "}")
 	return res
-}
-
-// formatArrayRepr wraps a pre-rendered array repr in colored brackets.
-func (f lineFormatter) formatArrayRepr(repr string) string {
-	if repr == "" || repr == "[]" {
-		return f.colorize(ansiBlue, "[]")
-	}
-	// repr comes from C as "[elem, elem, ...]" — re-bracket in our color scheme
-	inner := repr
-	if strings.HasPrefix(repr, "[") && strings.HasSuffix(repr, "]") {
-		inner = repr[1 : len(repr)-1]
-	}
-	return f.colorize(ansiBlue, "[") + f.colorize(ansiCyan, inner) + f.colorize(ansiBlue, "]")
 }
 
 // ============================================================================
@@ -842,7 +821,7 @@ func emitExceptionEvent(offset int, frame *callFrame, result JNIValue) bool {
 			classStr := f.formatClassName(result.Str)
 			var msgStr string
 			if result.Extra != "" {
-				msgStr = " " + f.colorize(ansiYellow, `"`+result.Extra+`"`)
+				msgStr = " " + f.colorize(ansiYellow, `"`+escapeControlChars(result.Extra)+`"`)
 			}
 			writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s%s %s",
 				f.formatOffset(offset),
@@ -866,17 +845,21 @@ func emitExceptionEvent(offset int, frame *callFrame, result JNIValue) bool {
 			if arg0.Kind == KindObject || arg0.Kind == KindClass {
 				classStr = f.formatClassName(arg0.Str)
 				if arg0.Extra != "" {
-					msgStr = " " + f.colorize(ansiYellow, `"`+arg0.Extra+`"`)
+					msgStr = " " + f.colorize(ansiYellow, `"`+escapeControlChars(arg0.Extra)+`"`)
 				}
 			} else {
 				classStr = f.formatJNIValue(arg0)
 			}
 		}
-		// For ThrowNew, the second arg is the message string
+		// For ThrowNew, the second arg is the message string.
+		// Sanitize: an attacker-controlled exception message reaches the
+		// operator's terminal here. Every other Java-string display site
+		// already passes through escapeControlChars; this one was missed in
+		// the prior pass.
 		if frame.jniName == "ThrowNew" && len(frame.args) > 1 {
 			arg1 := frame.args[1]
 			if arg1.Kind == KindString {
-				msgStr = " " + f.colorize(ansiYellow, `"`+arg1.Str+`"`)
+				msgStr = " " + f.colorize(ansiYellow, `"`+escapeControlChars(arg1.Str)+`"`)
 			}
 		}
 		writeLine(logLevelInfo, fmt.Sprintf("%s%s %s%s %s",
@@ -971,11 +954,59 @@ func extractKV(s, key string) string {
 	return s[start : start+end]
 }
 
-func truncate(s string, max int) string {
-	if len(s) <= max {
+// truncate clips s to at most maxRunes Unicode code points, appending "…"
+// when truncation occurs. Operates on runes (not bytes) so multi-byte UTF-8
+// sequences never get split mid-rune.
+func truncate(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return "…"
+	}
+	n := 0
+	for i := range s {
+		if n == maxRunes {
+			return s[:i] + "…"
+		}
+		n++
+	}
+	return s
+}
+
+// escapeControlChars replaces every C0/C1 control character with its \xNN
+// escape so that an untrusted Java string can't smuggle ANSI escape sequences
+// (or other terminal-mangling bytes) into the operator's terminal. \t, \n, \r
+// are emitted as their visible \t / \n / \r forms; all others become \xNN.
+// Non-ASCII bytes are left alone so UTF-8 text renders normally.
+func escapeControlChars(s string) string {
+	// Fast path: scan for any byte that needs escaping. Most strings don't.
+	needs := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == 0x7f {
+			needs = true
+			break
+		}
+	}
+	if !needs {
 		return s
 	}
-	return s[:max] + "…"
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '\t':
+			b.WriteString(`\t`)
+		case c == '\n':
+			b.WriteString(`\n`)
+		case c == '\r':
+			b.WriteString(`\r`)
+		case c < 0x20 || c == 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // ============================================================================
@@ -986,8 +1017,6 @@ var (
 	f         = lineFormatter{colorEnabled: os.Getenv("NO_COLOR") == ""}
 	jniLogger = newMultiOutputLogger(logcatSink{}, stdoutSink{})
 )
-
-func registerLogSink(sink logSink) { jniLogger.AddSink(sink) }
 
 func writeLine(level logLevel, line string) {
 	jniLogger.Write(logEvent{level: level, line: line})

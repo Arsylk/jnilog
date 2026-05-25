@@ -29,3 +29,9 @@ Thumbs.db
 # Log files from test sessions
 log_*.txt
 *.log
+# Runtime sink dump used by manual runs
+mlog.txt
+
+# Amazon Kiro IDE specs / steering — local-only by default.
+# Remove this line if you want to track .kiro/ deliberately.
+.kiro/

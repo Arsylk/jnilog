@@ -3,7 +3,7 @@
 package main
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../cbridge -I${SRCDIR}/../shared -include ${SRCDIR}/ndk_compat.h -I/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include
+#cgo CFLAGS: -I${SRCDIR}/../cbridge -include ${SRCDIR}/ndk_compat.h
 #cgo LDFLAGS: -ldl -llog
 #include "bridge.h"
 #include <stdlib.h>
