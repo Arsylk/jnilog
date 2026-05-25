@@ -52,12 +52,6 @@
       "type": "integer",
       "minimum": 0,
       "default": 16
-    },
-    "stack_depth": {
-      "description": "Native stack frames to unwind per call. 0 = off.",
-      "type": "integer",
-      "minimum": 0,
-      "default": 0
     }
   }
 }

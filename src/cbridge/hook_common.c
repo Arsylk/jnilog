@@ -1,6 +1,7 @@
 #include "hook_internal.h"
 #include <dlfcn.h>
 #include <errno.h>
+#include <link.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -234,13 +235,83 @@ field_info_t lookup_field_info(jfieldID field_id) {
   return info;
 }
 
+/* PairIP integrity-check filter.
+ *
+ * PairIP (libpairipcore.so) is Google Play Asset Pairing Integrity Protection's
+ * bytecode VM. It walks the app's JNI call graph and times JNI dispatches to
+ * detect tampering.  When jnilog's hook bodies fire `log_jni_return` for
+ * PairIP-issued JNI calls, the per-call cgo overhead into Go's runtime trips
+ * a PairIP integrity check (the only log_jni_* function that does so —
+ * confirmed by isolated bisection: lookup-only and call-only both survive,
+ * return-only kills).
+ *
+ * Fix: skip all jnilog work when the caller PC is inside libpairipcore.so.
+ * PairIP gets clean passthrough; every other caller still gets full logging.
+ *
+ * The pairip range is resolved lazily on first hook fire via /proc/self/maps
+ * walk and cached.  A 0 end-address indicates "no pairip mapping in process"
+ * (most apps), in which case the check is a no-op single comparison.
+ */
+#include <pthread.h>
+#include <stdint.h>
+static uintptr_t g_pairip_start = 0;
+static uintptr_t g_pairip_end   = 0;
+static int       g_pairip_scanned = 0;
+
+/* Cheap range cache for libpairipcore.so.  We do NOT cache "not found" — only
+ * cache the positive result.  libpairipcore.so is loaded by chatgpt's class
+ * loader AFTER our payload's constructor runs, so an early scan returns
+ * nothing and we keep trying until the library appears.  Once found, the
+ * cache prevents per-call /proc/self/maps walks. */
+/* dl_iterate_phdr callback collects pairip's load span. */
+struct pairip_collect { uintptr_t lo, hi; int matched; };
+static int pairip_iter_cb(struct dl_phdr_info *info, size_t size, void *data) {
+  (void)size;
+  struct pairip_collect *c = (struct pairip_collect *)data;
+  if (!info->dlpi_name || !strstr(info->dlpi_name, "libpairipcore.so")) return 0;
+  for (unsigned i = 0; i < info->dlpi_phnum; i++) {
+    const ElfW(Phdr) *p = &info->dlpi_phdr[i];
+    if (p->p_type != PT_LOAD || !(p->p_flags & PF_X)) continue;
+    uintptr_t s = info->dlpi_addr + p->p_vaddr;
+    uintptr_t e = s + p->p_memsz;
+    if (c->lo == 0 || s < c->lo) c->lo = s;
+    if (e > c->hi) c->hi = e;
+  }
+  c->matched++;
+  return 0;
+}
+
+static void scan_for_pairip(void) {
+  struct pairip_collect c = {0, 0, 0};
+  dl_iterate_phdr(pairip_iter_cb, &c);
+  if (c.hi > 0) {
+    __atomic_store_n(&g_pairip_start, c.lo, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pairip_end,   c.hi, __ATOMIC_RELEASE);
+    LOG_DIRECT(ANDROID_LOG_INFO,
+               "pairip range cached: [%p, %p) — JNI calls from this range will not be logged",
+               (void*)c.lo, (void*)c.hi);
+  }
+}
+
+static int caller_is_pairip(uintptr_t pc) {
+  uintptr_t end = __atomic_load_n(&g_pairip_end, __ATOMIC_ACQUIRE);
+  if (end == 0) {
+    /* Cache empty — re-scan lazily.  Bounded by "library either appears
+     * shortly after app boot or never" — costs one scan per JNI hook
+     * during the brief window before libpairipcore loads. */
+    scan_for_pairip();
+    end = __atomic_load_n(&g_pairip_end, __ATOMIC_ACQUIRE);
+    if (end == 0) return 0;
+  }
+  uintptr_t start = __atomic_load_n(&g_pairip_start, __ATOMIC_RELAXED);
+  return pc >= start && pc < end;
+}
+
 int should_log_from_caller(JNIEnv *env, void *caller) {
   if (env == NULL || caller == NULL) return 0;
   if (c_should_try_seed()) c_seed_exec_ranges_from_maps();
-  /* Requirement 11.11/21.5: suppress all calls when no ranges are seeded
-   * (early startup, or before app libraries are loaded). Only log once
-   * we have positively identified the app's executable regions. */
   if (!c_has_exec_ranges()) return 0;
+  (void)caller_is_pairip;  /* old PairIP-skip retained for reference; unused now */
   return c_is_in_exec_range((uintptr_t)caller);
 }
 

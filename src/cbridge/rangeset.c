@@ -23,16 +23,9 @@
 #include <android/log.h>
 #endif
 
-#define RANGESET_LOG_TAG "JNILog"
+#include "ansi.h"
 
-/* ANSI color codes for logcat output */
-#define C_RESET   "\x1b[0m"
-#define C_DIM     "\x1b[2m"
-#define C_CYAN    "\x1b[36m"
-#define C_YELLOW  "\x1b[33m"
-#define C_GREEN   "\x1b[32m"
-#define C_ORANGE  "\x1b[38;5;214m"
-#define C_LAVENDER "\x1b[38;2;180;190;254m"
+#define RANGESET_LOG_TAG "JNILog"
 
 /* ====================================================================
  * Package name

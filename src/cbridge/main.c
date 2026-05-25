@@ -18,12 +18,36 @@
 #include "bridge.h"
 #include "hook_internal.h"
 #include "visualize.h"
+#include "ansi.h"
 
 #include "_cgo_export.h"
 
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
 #endif
+
+/* dlopen-subsystem log shape (see go-logging spec): every line starts with a
+ * dim "[dlopen]" tag — distinguishes them at-a-glance from JNI-call lines,
+ * which never carry a subsystem prefix — followed by a short lowercase verb
+ * message and key=value pairs with snake_case keys. The tag is the only
+ * decoration the JNI lines never use, so visual separation is automatic. */
+#define DL_TAG     C_DIM "[dlopen]" C_RESET
+#define DL_KEY(k)  C_GRAY k "=" C_RESET
+
+/* sanitize_for_log copies src into dst with every byte < 0x20 (and 0x7f)
+ * replaced by '?'. Used on attacker-controlled dlopen() filenames so a
+ * malicious caller can't inject ANSI escapes through the logcat stream. */
+static const char* sanitize_for_log(char* dst, size_t dstsize, const char* src) {
+    if (!dst || dstsize == 0) return "";
+    if (!src) { dst[0] = '\0'; return dst; }
+    size_t i = 0;
+    for (; i + 1 < dstsize && src[i]; i++) {
+        unsigned char c = (unsigned char)src[i];
+        dst[i] = (c < 0x20 || c == 0x7f) ? '?' : (char)c;
+    }
+    dst[i] = '\0';
+    return dst;
+}
 
 /* Global state */
 static int g_initialized = 0;
@@ -54,7 +78,18 @@ void* android_dlopen_ext(const char* path, int flags, const android_dlextinfo* e
     void* (*real)(const char*, int, const android_dlextinfo*) = real_android_dlopen_ext;
     if (!real) return NULL;
     void* handle = real(path, flags, extinfo);
-    if (handle) { c_reset_seed_attempted(); c_seed_exec_ranges_from_maps(); }
+    if (handle) {
+        char path_safe[512];
+        LOG_DIRECT(ANDROID_LOG_DEBUG,
+                   DL_TAG " open "
+                   DL_KEY("fn")     C_MAGENTA  "android_dlopen_ext" C_RESET " "
+                   DL_KEY("path")   C_CYAN     "%s" C_RESET " "
+                   DL_KEY("flags")  C_GRAY     "0x%x" C_RESET " "
+                   DL_KEY("handle") C_LAVENDER "%p" C_RESET,
+                   sanitize_for_log(path_safe, sizeof(path_safe), path), flags, handle);
+        c_reset_seed_attempted();
+        c_seed_exec_ranges_from_maps();
+    }
     return handle;
 }
 
@@ -75,8 +110,14 @@ static void* hooked_loader_dlopen(const char* filename, int flags, const void* c
     if (!orig) return NULL;
     void* handle = orig(filename, flags, caller_addr);
     if (handle) {
-        LOG_DIRECT(ANDROID_LOG_DEBUG, "__loader_dlopen(%s, 0x%x) = %p",
-                   filename ? filename : "<null>", flags, handle);
+        char fn_safe[512];
+        LOG_DIRECT(ANDROID_LOG_DEBUG,
+                   DL_TAG " open "
+                   DL_KEY("fn")     C_MAGENTA  "__loader_dlopen" C_RESET " "
+                   DL_KEY("path")   C_CYAN     "%s" C_RESET " "
+                   DL_KEY("flags")  C_GRAY     "0x%x" C_RESET " "
+                   DL_KEY("handle") C_LAVENDER "%p" C_RESET,
+                   sanitize_for_log(fn_safe, sizeof(fn_safe), filename), flags, handle);
         c_reset_seed_attempted();
         c_seed_exec_ranges_from_maps();
     }
@@ -92,8 +133,14 @@ static void* hooked_loader_android_dlopen_ext(const char* filename, int flags,
     if (!orig) return NULL;
     void* handle = orig(filename, flags, extinfo, caller_addr);
     if (handle) {
-        LOG_DIRECT(ANDROID_LOG_DEBUG, "__loader_android_dlopen_ext(%s, 0x%x) = %p",
-                   filename ? filename : "<null>", flags, handle);
+        char fn_safe[512];
+        LOG_DIRECT(ANDROID_LOG_DEBUG,
+                   DL_TAG " open "
+                   DL_KEY("fn")     C_MAGENTA  "__loader_android_dlopen_ext" C_RESET " "
+                   DL_KEY("path")   C_CYAN     "%s" C_RESET " "
+                   DL_KEY("flags")  C_GRAY     "0x%x" C_RESET " "
+                   DL_KEY("handle") C_LAVENDER "%p" C_RESET,
+                   sanitize_for_log(fn_safe, sizeof(fn_safe), filename), flags, handle);
 
         /* If the package name isn't resolved yet, try to extract it from the
          * loaded library path. Paths like /data/app/~~xxx==/com.pkg.name-yyy==/...
@@ -128,7 +175,10 @@ static void* hooked_loader_android_dlopen_ext(const char* filename, int flags,
 static void install_loader_dlopen_hook(void) {
     uintptr_t base = maps_find_lib_base("/libdl.so");
     if (!base) {
-        LOG_DIRECT(ANDROID_LOG_WARN, "install_loader_dlopen_hook: libdl.so not found");
+        LOG_DIRECT(ANDROID_LOG_WARN,
+                   DL_TAG " hook install skipped "
+                   DL_KEY("reason") C_YELLOW "lib_not_found" C_RESET " "
+                   DL_KEY("lib")    C_CYAN   "libdl.so" C_RESET);
         return;
     }
 
@@ -162,14 +212,18 @@ static void install_loader_dlopen_hook(void) {
 
     if (!symtab || !strtab || !rela_plt || !rela_plt_sz) {
         LOG_DIRECT(ANDROID_LOG_WARN,
-                   "install_loader_dlopen_hook: missing PLT sections in libdl.so");
+                   DL_TAG " hook install skipped "
+                   DL_KEY("reason") C_YELLOW "plt_sections_missing" C_RESET " "
+                   DL_KEY("lib")    C_CYAN   "libdl.so" C_RESET);
         return;
     }
 
     pthread_once(&mprotect_resolve_once, resolve_mprotect);
     if (!real_mprotect) {
         LOG_DIRECT(ANDROID_LOG_WARN,
-                   "install_loader_dlopen_hook: real_mprotect not available");
+                   DL_TAG " hook install skipped "
+                   DL_KEY("reason") C_YELLOW  "mprotect_unavailable" C_RESET " "
+                   DL_KEY("fn")     C_MAGENTA "real_mprotect" C_RESET);
         return;
     }
 
@@ -199,7 +253,10 @@ static void install_loader_dlopen_hook(void) {
                              __ATOMIC_RELEASE);
             real_mprotect(page, (size_t)page_size * 2, PROT_READ);
             LOG_DIRECT(ANDROID_LOG_INFO,
-                       "install_loader_dlopen_hook: patched __loader_dlopen in libdl.so GOT (orig=%p)",
+                       DL_TAG " hook installed "
+                       DL_KEY("fn")   C_MAGENTA  "__loader_dlopen" C_RESET " "
+                       DL_KEY("lib")  C_CYAN     "libdl.so" C_RESET " "
+                       DL_KEY("orig") C_LAVENDER "%p" C_RESET,
                        (void*)orig_loader_dlopen);
             found_dlopen = 1;
         } else if (!found_dlopen_ext && strcmp(sym_name, "__loader_android_dlopen_ext") == 0) {
@@ -212,7 +269,10 @@ static void install_loader_dlopen_hook(void) {
                              __ATOMIC_RELEASE);
             real_mprotect(page, (size_t)page_size * 2, PROT_READ);
             LOG_DIRECT(ANDROID_LOG_INFO,
-                       "install_loader_dlopen_hook: patched __loader_android_dlopen_ext in libdl.so GOT (orig=%p)",
+                       DL_TAG " hook installed "
+                       DL_KEY("fn")   C_MAGENTA  "__loader_android_dlopen_ext" C_RESET " "
+                       DL_KEY("lib")  C_CYAN     "libdl.so" C_RESET " "
+                       DL_KEY("orig") C_LAVENDER "%p" C_RESET,
                        (void*)orig_loader_android_dlopen_ext);
             found_dlopen_ext = 1;
         }
@@ -222,10 +282,16 @@ static void install_loader_dlopen_hook(void) {
 
     if (!found_dlopen)
         LOG_DIRECT(ANDROID_LOG_WARN,
-                   "install_loader_dlopen_hook: __loader_dlopen not found in libdl.so PLT");
+                   DL_TAG " hook install skipped "
+                   DL_KEY("reason") C_YELLOW  "symbol_not_in_plt" C_RESET " "
+                   DL_KEY("fn")     C_MAGENTA "__loader_dlopen" C_RESET " "
+                   DL_KEY("lib")    C_CYAN    "libdl.so" C_RESET);
     if (!found_dlopen_ext)
         LOG_DIRECT(ANDROID_LOG_WARN,
-                   "install_loader_dlopen_hook: __loader_android_dlopen_ext not found in libdl.so PLT");
+                   DL_TAG " hook install skipped "
+                   DL_KEY("reason") C_YELLOW  "symbol_not_in_plt" C_RESET " "
+                   DL_KEY("fn")     C_MAGENTA "__loader_android_dlopen_ext" C_RESET " "
+                   DL_KEY("lib")    C_CYAN    "libdl.so" C_RESET);
 }
 
 int mprotect(void* addr, size_t len, int prot) {

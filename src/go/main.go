@@ -90,42 +90,23 @@ type callFrame struct {
 	caller     string
 }
 
-var (
-	threadStacks = make(map[int][]*callFrame)
-	stacksMu     sync.Mutex
-)
-
-func pushCallFrame(tid int, frame *callFrame) {
-	stacksMu.Lock()
-	defer stacksMu.Unlock()
-	threadStacks[tid] = append(threadStacks[tid], frame)
+// pendingCall holds a call-site frame plus its offset until the matching
+// return arrives via goJNIReturnCallback.
+type pendingCall struct {
+	frame  *callFrame
+	offset int
 }
 
-func popCallFrame(tid int) *callFrame {
-	stacksMu.Lock()
-	defer stacksMu.Unlock()
-	stack := threadStacks[tid]
-	if len(stack) == 0 {
-		return nil
-	}
-	frame := stack[len(stack)-1]
-	// Drop the map entry when the tid's stack reaches zero so transient Java
-	// worker threads don't leak into threadStacks forever (Android pools and
-	// reuses tids, but a short-lived thread that never returns to balance
-	// would otherwise pin its slot indefinitely).
-	if len(stack) == 1 {
-		delete(threadStacks, tid)
-	} else {
-		threadStacks[tid] = stack[:len(stack)-1]
-	}
-	return frame
-}
+// pendingCalls is keyed by the call_id assigned in C (atomic uint64 counter,
+// stashed per-thread on the C side, passed through both callbacks).  Using a
+// per-call unique key avoids the per-tid stack push/pop pattern that the
+// previous design needed a global Mutex for.
+var pendingCalls sync.Map // map[uint64]*pendingCall
 
-// goJNICallCallback is invoked at each JNI method call entry point.
-//
 //export goJNICallCallback
 func goJNICallCallback(
-	_ C.int, // offset — reserved; emitCallFull uses formatOffset which is a no-op
+	callID C.uint64_t,
+	offset C.int,
 	jniName *C.char,
 	receiverKind C.int,
 	receiverStr *C.char,
@@ -138,23 +119,23 @@ func goJNICallCallback(
 ) {
 	receiver := decodeSingleReceiver(int(receiverKind), C.GoString(receiverStr), C.GoString(receiverExtra))
 	args := decodeArgs(C.GoString(encodedArgs))
-
-	tid := int(C.jni_log_get_tid())
-	pushCallFrame(tid, &callFrame{
-		jniName:    C.GoString(jniName),
-		mid:        uintptr(mid),
-		className:  normalizeDots(C.GoString(className)),
-		methodName: C.GoString(methodName),
-		receiver:   receiver,
-		args:       args,
-		caller:     C.GoString(caller),
+	pendingCalls.Store(uint64(callID), &pendingCall{
+		offset: int(offset),
+		frame: &callFrame{
+			jniName:    C.GoString(jniName),
+			mid:        uintptr(mid),
+			className:  normalizeDots(C.GoString(className)),
+			methodName: C.GoString(methodName),
+			receiver:   receiver,
+			args:       args,
+			caller:     C.GoString(caller),
+		},
 	})
 }
 
-// goJNIReturnCallback is invoked after the JNI method has returned.
-//
 //export goJNIReturnCallback
 func goJNIReturnCallback(
+	callID C.uint64_t,
 	offset C.int,
 	name *C.char,
 	retKind C.int,
@@ -162,14 +143,20 @@ func goJNIReturnCallback(
 	retStr *C.char,
 	retExtra *C.char,
 ) {
-	tid := int(C.jni_log_get_tid())
-	frame := popCallFrame(tid)
-	if frame == nil {
+	v, ok := pendingCalls.LoadAndDelete(uint64(callID))
+	if !ok {
+		// No matching call (e.g. log_jni_return fired without a prior
+		// log_jni_call — common for void/passthrough hook bodies).
+		// Emit as standalone return for those that have a payload.
+		result := buildReturnValue(int(retKind), uintptr(retRaw),
+			C.GoString(retStr), C.GoString(retExtra))
+		emitStandaloneReturn(int(offset), C.GoString(name), result)
 		return
 	}
-
-	result := buildReturnValue(int(retKind), uintptr(retRaw), C.GoString(retStr), C.GoString(retExtra))
-	emitCallFull(int(offset), frame, result)
+	pc := v.(*pendingCall)
+	result := buildReturnValue(int(retKind), uintptr(retRaw),
+		C.GoString(retStr), C.GoString(retExtra))
+	emitCallFull(pc.offset, pc.frame, result)
 }
 
 //export goJNILookupCallback

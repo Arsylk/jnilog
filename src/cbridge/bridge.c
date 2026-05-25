@@ -126,10 +126,27 @@ const char* art_get_field_name(void* field_id) {
  * ============================================================================ */
 
 /*
- * log_jni_call — invoked at method entry.
- * All string params are guaranteed non-NULL by hooks.c / hook_logging.c
- * (callers pass "" rather than NULL).
+ * Call/return pairing via monotonic atomic counter.
+ *
+ * Each log_jni_call increments g_call_id_counter and stashes the value in a
+ * __thread slot.  log_jni_return reads the same TLS slot, so the same thread's
+ * matching return picks up the exact ID without a global map or mutex.  The
+ * ID is passed to both Go callbacks; the Go side uses it as a sync.Map key
+ * to pair the call frame with its result for emit.
+ *
+ * This replaces the old design of a globally-locked tid→[]callFrame map whose
+ * mutex acquire/release pattern across thousands of JNI events per second
+ * was a major source of Go scheduler activity.
+ *
+ * Recursion within a single thread (rare — should_log_from_caller gates
+ * vis_* helper re-entry) would corrupt the TLS slot.  We don't pair
+ * nested calls because the outer call's ID is overwritten; the outer
+ * return then sees ID=0 and emits as unmatched.  Acceptable: this is
+ * vastly less common than the typical call/return on the same thread.
  */
+static uint64_t            g_call_id_counter = 0;
+static __thread uint64_t   tls_last_call_id  = 0;
+
 void log_jni_call(
         int offset,
         const char* jni_name,
@@ -143,7 +160,10 @@ void log_jni_call(
         const char* caller) {
     if (!goGetLoggingReady()) return;
     if (!config_is_allowed(jni_name)) return;
+    uint64_t cid = __atomic_add_fetch(&g_call_id_counter, 1, __ATOMIC_RELAXED);
+    tls_last_call_id = cid;
     goJNICallCallback(
+        cid,
         offset,
         (char*)jni_name,
         receiver_kind,
@@ -170,7 +190,10 @@ void log_jni_return(
         const char* ret_extra) {
     if (!goGetLoggingReady()) return;
     if (!config_is_allowed(name)) return;
+    uint64_t cid = tls_last_call_id;
+    tls_last_call_id = 0;
     goJNIReturnCallback(
+        cid,
         offset,
         (char*)(name     ? name     : ""),
         ret_kind,

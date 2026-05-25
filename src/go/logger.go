@@ -581,6 +581,25 @@ func emitCallFull(offset int, frame *callFrame, result JNIValue) {
 	}
 }
 
+// emitStandaloneReturn renders a return-only line for the no-frame-tracking
+// design (see goJNIReturnCallback comment in main.go).  Void returns are
+// suppressed — they carry no payload to display.
+func emitStandaloneReturn(offset int, name string, result JNIValue) {
+	if configSignatureBlacklisted(name) {
+		return
+	}
+	if result.Kind == KindVoid {
+		return
+	}
+	methodTag := f.dim("[" + name + "]")
+	writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s",
+		f.formatOffset(offset),
+		methodTag,
+		f.formatArrow(),
+		f.formatJNIValue(result),
+	))
+}
+
 // emitJNILookup renders GetMethodID / FindClass / GetFieldID events.
 func emitJNILookup(lookupType string, name string, sig string, classHandle uintptr, className string, caller string) {
 	// Gate 3: regex blacklist

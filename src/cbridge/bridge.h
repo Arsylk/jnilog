@@ -231,6 +231,7 @@ typedef struct {
  * ============================================================================ */
 #ifndef _CGO_EXPORT_H_
 extern void goJNICallCallback(
+    uint64_t call_id,
     int offset,
     char* jni_name,
     int receiver_kind,
@@ -243,6 +244,7 @@ extern void goJNICallCallback(
     char* caller);
 
 extern void goJNIReturnCallback(
+    uint64_t call_id,
     int offset,
     char* name,
     int ret_kind,
