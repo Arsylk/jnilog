@@ -16,6 +16,7 @@
 #endif
 #include "bridge.h"
 #include "hook_internal.h"
+#include "event_pipe.h"
 #include "_cgo_export.h"
 
 static const char* k_log_tag = "JNILogPayload";
@@ -98,6 +99,12 @@ void bridge_init(void) {
     // Each interposition wrapper (dlopen, android_dlopen_ext, mprotect) already calls
     // pthread_once(&loader_symbol_once, resolve_loader_symbols_once) lazily on first use.
     resolve_art_symbols();
+    int rc = event_pipe_init();
+    if (rc == 0) {
+        LOG_DIRECT(ANDROID_LOG_INFO, "event_pipe ready: consumer_fd=%d", event_pipe_consumer_fd());
+    } else {
+        LOG_DIRECT(ANDROID_LOG_ERROR, "event_pipe init failed: %d", rc);
+    }
 }
 
 static void bridge_activate_go_once(void) {
@@ -178,18 +185,10 @@ void log_jni_call(
     if (!config_is_allowed(jni_name)) return;
     uint64_t cid = __atomic_add_fetch(&g_call_id_counter, 1, __ATOMIC_RELAXED);
     tls_last_call_id = cid;
-    goJNICallCallback(
-        cid,
-        offset,
-        (char*)jni_name,
-        receiver_kind,
-        (char*)(receiver_str   ? receiver_str   : ""),
-        (char*)(receiver_extra ? receiver_extra : ""),
-        (char*)(class_name     ? class_name     : ""),
-        (char*)(method_name    ? method_name    : ""),
-        (char*)(encoded_args   ? encoded_args   : ""),
-        mid,
-        (char*)(caller         ? caller         : ""));
+    /* Push to the C→Go event socket — no cgo on this path. */
+    event_pipe_emit_call(cid, offset, receiver_kind, mid,
+                         jni_name, receiver_str, receiver_extra,
+                         class_name, method_name, encoded_args, caller);
 }
 
 /*
@@ -208,14 +207,8 @@ void log_jni_return(
     if (!config_is_allowed(name)) return;
     uint64_t cid = tls_last_call_id;
     tls_last_call_id = 0;
-    goJNIReturnCallback(
-        cid,
-        offset,
-        (char*)(name     ? name     : ""),
-        ret_kind,
-        ret_raw,
-        (char*)(ret_str  ? ret_str  : ""),
-        (char*)(ret_extra ? ret_extra : ""));
+    event_pipe_emit_return(cid, offset, ret_kind, ret_raw,
+                           name, ret_str, ret_extra);
 }
 
 /*
@@ -231,13 +224,8 @@ void log_jni_lookup(
         const char* caller) {
     if (!logging_ready_fast()) return;
     if (!config_is_allowed(lookup_type)) return;
-    goJNILookupCallback(
-        (char*)lookup_type,
-        (char*)name,
-        (char*)(sig        ? sig        : ""),
-        (uintptr_t)clazz,
-        (char*)(class_name ? class_name : ""),
-        (char*)(caller     ? caller     : ""));
+    event_pipe_emit_lookup((uintptr_t)clazz, lookup_type, name, sig,
+                           class_name, caller);
 }
 
 /*

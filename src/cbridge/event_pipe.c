@@ -1,0 +1,185 @@
+/*
+ * event_pipe.c — see event_pipe.h for the protocol description.
+ *
+ * Design notes:
+ *
+ * - The writer fd is non-blocking with a 1 MB SNDBUF.  If the Go reader is
+ *   ever behind, send() returns EAGAIN and the event is dropped silently.
+ *   We never block the calling thread — anti-tamper VMs would notice the
+ *   stall just as readily as they notice cgo cadence.
+ *
+ * - Each emit builds the record on the stack.  Max datagram size is
+ *   EVENT_MAX_BYTES; strings are truncated past their per-slot limit.  The
+ *   limits are generous (Go-side renderers truncate further if needed).
+ *
+ * - send() to AF_UNIX SOCK_DGRAM preserves message boundaries — every
+ *   read() on the consumer end returns exactly one event record, no
+ *   framing needed on the Go side beyond parsing the fixed header.
+ */
+
+#include "event_pipe.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+/* Per-string max bytes when packing into the datagram.  Strings longer
+ * than this are truncated.  Generous enough that the Go-side rendering
+ * never sees a string the user-visible logger would otherwise have. */
+#define EV_STR_MAX_BYTES   512
+/* Hard upper bound on a single datagram.  Sum of fixed header + maximum
+ * string payloads + their length prefixes, rounded up.  Generous. */
+#define EVENT_MAX_BYTES    8192
+/* Writer-side SNDBUF target (best-effort; SO_SNDBUF rounds to kernel
+ * allocator quantum).  Sized to hold ~hundreds of mid-sized events
+ * during burst load before EAGAIN drops kick in. */
+#define EVENT_SNDBUF       (1 << 20)   /* 1 MiB */
+
+#define HDR_FIXED_BYTES    32
+
+static int g_writer_fd  = -1;
+static int g_reader_fd  = -1;
+static pthread_mutex_t g_send_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ── little-endian writers (no host-byte-order assumptions) ─────────── */
+static inline void put_u8 (uint8_t  *p, size_t off, uint8_t  v)  { p[off] = v; }
+static inline void put_u16(uint8_t  *p, size_t off, uint16_t v)  { p[off]=v; p[off+1]=v>>8; }
+static inline void put_u32(uint8_t  *p, size_t off, uint32_t v)  { p[off]=v; p[off+1]=v>>8; p[off+2]=v>>16; p[off+3]=v>>24; }
+static inline void put_u64(uint8_t  *p, size_t off, uint64_t v)  {
+    for (int i = 0; i < 8; i++) p[off + i] = (uint8_t)(v >> (i * 8));
+}
+static inline void put_i32(uint8_t  *p, size_t off, int32_t  v)  { put_u32(p, off, (uint32_t)v); }
+
+/* Append a length-prefixed string to buf at *pos.  s may be NULL → treated as
+ * empty string.  Truncates at EV_STR_MAX_BYTES.  Returns 0 on success or -1
+ * if the buffer would overflow. */
+static int append_str(uint8_t *buf, size_t *pos, size_t cap, const char *s) {
+    if (!s) s = "";
+    size_t len = strlen(s);
+    if (len > EV_STR_MAX_BYTES) len = EV_STR_MAX_BYTES;
+    if (*pos + 2 + len > cap) return -1;
+    put_u16(buf, *pos, (uint16_t)len);
+    if (len) memcpy(buf + *pos + 2, s, len);
+    *pos += 2 + len;
+    return 0;
+}
+
+/* ── header build ────────────────────────────────────────────────────── */
+static size_t put_header(uint8_t *buf,
+                         uint8_t event_type,
+                         uint8_t receiver_kind, uint8_t ret_kind,
+                         uint8_t nstrings,
+                         int32_t offset,
+                         uint64_t call_id, uint64_t mid_or_raw)
+{
+    put_u32(buf, 0,  JNIEVT_MAGIC);
+    put_u8 (buf, 4,  event_type);
+    put_u8 (buf, 5,  receiver_kind);
+    put_u8 (buf, 6,  ret_kind);
+    put_u8 (buf, 7,  nstrings);
+    put_i32(buf, 8,  offset);
+    put_u32(buf, 12, 0);                /* reserved */
+    put_u64(buf, 16, call_id);
+    put_u64(buf, 24, mid_or_raw);
+    return HDR_FIXED_BYTES;
+}
+
+/* ── lifecycle ──────────────────────────────────────────────────────── */
+int event_pipe_init(void) {
+    if (g_writer_fd >= 0) return 0;     /* idempotent */
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sv) != 0) {
+        return -errno;
+    }
+    /* Writer non-blocking — never stall the JNI hook on backpressure. */
+    int flags = fcntl(sv[0], F_GETFL, 0);
+    if (flags >= 0) fcntl(sv[0], F_SETFL, flags | O_NONBLOCK);
+    /* Larger SNDBUF tolerates burst loads from PairIP's JNI dispatch loop. */
+    int sndbuf = EVENT_SNDBUF;
+    (void)setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    int rcvbuf = EVENT_SNDBUF;
+    (void)setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    g_writer_fd = sv[0];
+    g_reader_fd = sv[1];
+    return 0;
+}
+
+int event_pipe_consumer_fd(void) { return g_reader_fd; }
+
+/* ── send helper ────────────────────────────────────────────────────── */
+static int send_record(const uint8_t *buf, size_t len) {
+    if (g_writer_fd < 0) return -1;
+    /* AF_UNIX SOCK_DGRAM send() is atomic per message — no partial writes.
+     * Mutex protects against concurrent send() that could interleave at
+     * the kernel level on some implementations; it does NOT serialize the
+     * hot path significantly because send() itself is fast. */
+    pthread_mutex_lock(&g_send_lock);
+    ssize_t n = send(g_writer_fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+    pthread_mutex_unlock(&g_send_lock);
+    if (n == (ssize_t)len) return 0;
+    /* EAGAIN/EWOULDBLOCK — Go reader behind; drop the event. */
+    return -1;
+}
+
+/* ── emit functions ─────────────────────────────────────────────────── */
+int event_pipe_emit_call(
+        uint64_t call_id, int32_t offset,
+        int receiver_kind, uintptr_t mid,
+        const char *jni_name,
+        const char *receiver_str, const char *receiver_extra,
+        const char *class_name, const char *method_name,
+        const char *encoded_args, const char *caller)
+{
+    uint8_t buf[EVENT_MAX_BYTES];
+    size_t  pos = put_header(buf, EV_CALL,
+                             (uint8_t)receiver_kind, 0,
+                             /* nstrings = */ 7,
+                             offset, call_id, (uint64_t)mid);
+    if (append_str(buf, &pos, sizeof(buf), jni_name)        ||
+        append_str(buf, &pos, sizeof(buf), receiver_str)    ||
+        append_str(buf, &pos, sizeof(buf), receiver_extra)  ||
+        append_str(buf, &pos, sizeof(buf), class_name)      ||
+        append_str(buf, &pos, sizeof(buf), method_name)     ||
+        append_str(buf, &pos, sizeof(buf), encoded_args)    ||
+        append_str(buf, &pos, sizeof(buf), caller)) return -1;
+    return send_record(buf, pos);
+}
+
+int event_pipe_emit_return(
+        uint64_t call_id, int32_t offset, int ret_kind,
+        uintptr_t ret_raw,
+        const char *name, const char *ret_str, const char *ret_extra)
+{
+    uint8_t buf[EVENT_MAX_BYTES];
+    size_t  pos = put_header(buf, EV_RETURN,
+                             0, (uint8_t)ret_kind,
+                             /* nstrings = */ 3,
+                             offset, call_id, (uint64_t)ret_raw);
+    if (append_str(buf, &pos, sizeof(buf), name)     ||
+        append_str(buf, &pos, sizeof(buf), ret_str)  ||
+        append_str(buf, &pos, sizeof(buf), ret_extra)) return -1;
+    return send_record(buf, pos);
+}
+
+int event_pipe_emit_lookup(
+        uintptr_t clazz,
+        const char *lookup_type, const char *name, const char *sig,
+        const char *class_name, const char *caller)
+{
+    uint8_t buf[EVENT_MAX_BYTES];
+    size_t  pos = put_header(buf, EV_LOOKUP,
+                             0, 0,
+                             /* nstrings = */ 5,
+                             0, 0, (uint64_t)clazz);
+    if (append_str(buf, &pos, sizeof(buf), lookup_type) ||
+        append_str(buf, &pos, sizeof(buf), name)        ||
+        append_str(buf, &pos, sizeof(buf), sig)         ||
+        append_str(buf, &pos, sizeof(buf), class_name)  ||
+        append_str(buf, &pos, sizeof(buf), caller)) return -1;
+    return send_record(buf, pos);
+}

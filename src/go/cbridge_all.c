@@ -1,5 +1,6 @@
 //go:build android
 
+#include "../cbridge/event_pipe.c"
 #include "../cbridge/bridge.c"
 #include "../cbridge/hook_common.c"
 #include "../cbridge/hook_fields.c"

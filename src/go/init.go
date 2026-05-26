@@ -81,6 +81,7 @@ func goBridgeInit() {
 		}
 
 		goSetLoggingReady(1)
+		startEventPipeReader()
 	})
 }
 
