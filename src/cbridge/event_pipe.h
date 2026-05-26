@@ -45,6 +45,13 @@ enum jni_event_type {
     EV_CALL   = 1,
     EV_RETURN = 2,
     EV_LOOKUP = 3,
+    /* EV_OBJ_RETURN: jobject return value to be rendered off-thread.
+     * Carries a NewGlobalRef'd jobject in mid_or_raw — the Go consumer
+     * attaches to the JVM on its own OS thread, calls vis_* with its own
+     * JNIEnv* to format the object (class name + toString), then DeleteGlobalRef.
+     * Decoupling vis_* from the hook thread is what allows PairIP-protected
+     * apps to not flag jnilog as latency-anomalous on JNI dispatch. */
+    EV_OBJ_RETURN = 4,
 };
 
 /* Initialize the socketpair.  Called once from bridge_init.  Returns 0 on
@@ -59,6 +66,19 @@ int  event_pipe_consumer_fd(void);
 /* Maximum datagram size — must match EVENT_MAX_BYTES inside event_pipe.c.
  * Exposed for the Go-side reader to size its read buffer. */
 #define EVENT_PIPE_MAX_BYTES 8192
+
+/* Render an object globalref using the consumer thread's JNIEnv*.  Returns
+ * heap-allocated strings (caller frees via free()) for the class/string
+ * value and toString().  *out_kind receives one of WIRE_KIND_STRING,
+ * WIRE_KIND_CLASS, WIRE_KIND_OBJECT, or WIRE_KIND_NULL.  Pass NULL for
+ * out_extra if toString isn't wanted.  The function calls DeleteGlobalRef
+ * on gref before returning so the caller must NOT use gref afterwards. */
+int  event_pipe_render_obj(
+        void *consumer_env,
+        uintptr_t gref,
+        int *out_kind,
+        char **out_str,
+        char **out_extra);
 
 /* Hot-path emits.  Each builds a single packed datagram and sends it on
  * the writer fd.  Returns 0 on success, -1 if event_pipe is disabled or
@@ -81,5 +101,13 @@ int  event_pipe_emit_lookup(
         uintptr_t clazz,
         const char *lookup_type, const char *name, const char *sig,
         const char *class_name, const char *caller);
+
+/* EV_OBJ_RETURN: defer the vis_* rendering of an object return value to the
+ * Go-side consumer.  The hot path must call NewGlobalRef on the jobject and
+ * pass the resulting global ref as gref; the consumer is responsible for
+ * the matching DeleteGlobalRef after rendering. */
+int  event_pipe_emit_obj_return(
+        uint64_t call_id, int32_t offset,
+        uintptr_t gref, const char *name);
 
 #endif /* JNILOG_EVENT_PIPE_H */

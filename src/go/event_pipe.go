@@ -4,8 +4,20 @@ package main
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../cbridge
+#include <stdlib.h>
 #include <unistd.h>
+#include <jni.h>
 #include "event_pipe.h"
+
+// Helper: attach the calling OS thread to the JVM, return a JNIEnv*.
+// Returns NULL on failure.
+static void* attach_consumer_thread(void) {
+    JavaVM *vms[1]; jsize n = 0;
+    if (JNI_GetCreatedJavaVMs(vms, 1, &n) != JNI_OK || n < 1) return NULL;
+    JNIEnv *env = NULL;
+    if ((*vms[0])->AttachCurrentThreadAsDaemon(vms[0], &env, NULL) != JNI_OK) return NULL;
+    return env;
+}
 */
 import "C"
 
@@ -13,6 +25,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -23,10 +36,16 @@ const (
 	eventMagic         = 0x4A4E4945 // 'JNIE'
 	eventHdrFixedBytes = 32
 
-	evCall   = 1
-	evReturn = 2
-	evLookup = 3
+	evCall      = 1
+	evReturn    = 2
+	evLookup    = 3
+	evObjReturn = 4
 )
+
+// consumerEnv is the JNIEnv* the consumer goroutine owns (after
+// AttachCurrentThreadAsDaemon).  Used to call vis_* off the hook thread.
+// Set once at consumer goroutine start; never reassigned.
+var consumerEnv unsafe.Pointer
 
 var (
 	eventReaderOnce sync.Once
@@ -48,6 +67,18 @@ func startEventPipeReader() {
 }
 
 func eventPipeReadLoop(fd int) {
+	// Bind to a single OS thread for the lifetime of this goroutine so the
+	// AttachCurrentThreadAsDaemon call below produces a JNIEnv* that stays
+	// usable across all subsequent reads on this goroutine.
+	runtime.LockOSThread()
+	env := C.attach_consumer_thread()
+	if env == nil {
+		logNativeWarn("event_pipe: failed to attach consumer thread to JVM; off-thread rendering disabled")
+	} else {
+		consumerEnv = unsafe.Pointer(env)
+		logNativeInfo(fmt.Sprintf("event_pipe consumer attached to JVM, env=%p", env))
+	}
+
 	buf := make([]byte, int(C.EVENT_PIPE_MAX_BYTES))
 	for {
 		n, err := syscall.Read(fd, buf)
@@ -105,9 +136,59 @@ func dispatchEvent(data []byte) {
 			return
 		}
 		dispatchLookup(uintptr(midOrRaw), strs)
+	case evObjReturn:
+		if len(strs) != 1 {
+			return
+		}
+		dispatchObjReturn(callID, offset, uintptr(midOrRaw), strs[0])
 	default:
 		logNativeWarn(fmt.Sprintf("event_pipe unknown event type=%d", eventType))
 	}
+}
+
+// dispatchObjReturn renders the jobject globalref on the consumer thread
+// (vis_class_name / vis_object_tostring / vis_string_value), then routes to
+// the existing emitCallFull pairing path so the final ANSI output matches
+// the previous in-thread vis_* behavior byte-for-byte.
+//
+// The C helper takes ownership of gref and calls DeleteGlobalRef internally.
+func dispatchObjReturn(callID uint64, offset int, gref uintptr, name string) {
+	if consumerEnv == nil {
+		// Consumer didn't attach.  Leak the gref by design — we can't free it
+		// from a non-attached thread, and trying to DeleteGlobalRef from here
+		// without env crashes.  Emit a placeholder so the pairing still fires.
+		v, ok := pendingCalls.LoadAndDelete(callID)
+		if !ok {
+			return
+		}
+		pc := v.(*pendingCall)
+		emitCallFull(pc.offset, pc.frame, buildReturnValue(int(KindNull), 0, "", ""))
+		return
+	}
+	var (
+		cKind  C.int
+		cStr   *C.char
+		cExtra *C.char
+	)
+	C.event_pipe_render_obj(consumerEnv, C.uintptr_t(gref), &cKind, &cStr, &cExtra)
+	str := ""
+	extra := ""
+	if cStr != nil {
+		str = C.GoString(cStr)
+		C.free(unsafe.Pointer(cStr))
+	}
+	if cExtra != nil {
+		extra = C.GoString(cExtra)
+		C.free(unsafe.Pointer(cExtra))
+	}
+	result := buildReturnValue(int(cKind), gref, str, extra)
+	v, ok := pendingCalls.LoadAndDelete(callID)
+	if !ok {
+		emitStandaloneReturn(offset, name, result)
+		return
+	}
+	pc := v.(*pendingCall)
+	emitCallFull(pc.offset, pc.frame, result)
 }
 
 func parseStrings(buf []byte, n int) ([]string, bool) {

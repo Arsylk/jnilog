@@ -18,15 +18,19 @@
  */
 
 #include "event_pipe.h"
+#include "visualize.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#include <jni.h>
 
 /* Per-string max bytes when packing into the datagram.  Strings longer
  * than this are truncated.  Generous enough that the Go-side rendering
@@ -182,4 +186,55 @@ int event_pipe_emit_lookup(
         append_str(buf, &pos, sizeof(buf), class_name)  ||
         append_str(buf, &pos, sizeof(buf), caller)) return -1;
     return send_record(buf, pos);
+}
+
+int event_pipe_emit_obj_return(
+        uint64_t call_id, int32_t offset,
+        uintptr_t gref, const char *name)
+{
+    uint8_t buf[EVENT_MAX_BYTES];
+    size_t  pos = put_header(buf, EV_OBJ_RETURN,
+                             0, 0,
+                             /* nstrings = */ 1,
+                             offset, call_id, (uint64_t)gref);
+    if (append_str(buf, &pos, sizeof(buf), name)) return -1;
+    return send_record(buf, pos);
+}
+
+/* WIRE_KIND_* values are defined in bridge.h via hook_internal.h. */
+#include "hook_internal.h"
+
+int event_pipe_render_obj(
+        void *consumer_env,
+        uintptr_t gref,
+        int *out_kind,
+        char **out_str,
+        char **out_extra)
+{
+    JNIEnv *env = (JNIEnv*)consumer_env;
+    void *obj = (void*)gref;
+    if (out_str)   *out_str   = NULL;
+    if (out_extra) *out_extra = NULL;
+    if (out_kind)  *out_kind  = WIRE_KIND_NULL;
+    if (!env || !obj) return -1;
+
+    int kind; char *str = NULL, *extra = NULL;
+    if (vis_is_string(env, obj)) {
+        kind = WIRE_KIND_STRING;
+        str  = vis_string_value_raw(env, obj);
+    } else if (vis_is_class(env, obj)) {
+        kind = WIRE_KIND_CLASS;
+        str  = vis_class_name(env, obj);
+    } else {
+        kind = WIRE_KIND_OBJECT;
+        str   = vis_object_class_name(env, obj);
+        extra = vis_object_tostring(env, obj);
+    }
+    if (out_kind)  *out_kind  = kind;
+    if (out_str)   *out_str   = str;   else free(str);
+    if (out_extra) *out_extra = extra; else free(extra);
+
+    /* Release the global ref — caller no longer owns it. */
+    (*env)->DeleteGlobalRef(env, obj);
+    return 0;
 }

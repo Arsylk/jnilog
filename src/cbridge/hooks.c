@@ -220,27 +220,32 @@ static inline void _log_obj2_arg_call(int slot, const char *name,
     log_jni_return(JNI_SLOT(Slot), Name, WIRE_KIND_POINTER, \
                    (uintptr_t)(Val), "", "")
 
-/* Object return — resolve class/toString */
+/* Object return — defers vis_* class/toString lookup to the Go-side consumer
+ * thread.  We NewGlobalRef the object so the consumer (running on its own
+ * AttachCurrentThread'd JNIEnv*) can call vis_* against it without touching
+ * the hook thread's JNI dispatch path — keeping PairIP-measured JNI latency
+ * at its native baseline.  Consumer issues the matching DeleteGlobalRef. */
 static inline void _log_obj_ret(int slot, const char *name,
                                  JNIEnv *env, void *obj) {
     if (!obj) {
         log_jni_return(slot, name, WIRE_KIND_NULL, 0, "", "");
         return;
     }
-    int kind; char *str = NULL, *extra = NULL;
-    if (vis_is_string(env, obj)) {
-        kind = WIRE_KIND_STRING; str = vis_string_value_raw(env, obj);
-    } else if (vis_is_class(env, obj)) {
-        kind = WIRE_KIND_CLASS; str = vis_class_name(env, obj);
-    } else {
-        kind = WIRE_KIND_OBJECT;
-        str   = vis_object_class_name(env, obj);
-        extra = vis_object_tostring(env, obj);
+    /* NewGlobalRef: one JNI call, much cheaper than 4-5 vis_* JNI calls. */
+    void *gref = (void*)(*env)->NewGlobalRef(env, obj);
+    if (!gref) {
+        /* OOM in the global ref table — fall back to a void return so the
+         * call frame still gets emitted, just without the return payload. */
+        log_jni_return(slot, name, WIRE_KIND_NULL, 0, "", "");
+        return;
     }
-    log_jni_return(slot, name, kind, (uintptr_t)obj,
-                   str   ? str   : "",
-                   extra ? extra : "");
-    free(str); free(extra);
+    /* Pair with the matching call_id via the same TLS slot log_jni_return
+     * normally uses — Go side consumes call_id from event header. */
+    extern __thread uint64_t tls_last_call_id;
+    extern int event_pipe_emit_obj_return(uint64_t, int32_t, uintptr_t, const char*);
+    uint64_t cid = tls_last_call_id;
+    tls_last_call_id = 0;
+    event_pipe_emit_obj_return(cid, slot, (uintptr_t)gref, name ? name : "");
 }
 #define LOG_OBJ_RET(Env, Slot, Name, Obj) do { \
     set_reentrant_call(1); \
