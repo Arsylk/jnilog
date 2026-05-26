@@ -45,13 +45,12 @@ enum jni_event_type {
     EV_CALL   = 1,
     EV_RETURN = 2,
     EV_LOOKUP = 3,
-    /* EV_OBJ_RETURN: jobject return value to be rendered off-thread.
-     * Carries a NewGlobalRef'd jobject in mid_or_raw — the Go consumer
-     * attaches to the JVM on its own OS thread, calls vis_* with its own
-     * JNIEnv* to format the object (class name + toString), then DeleteGlobalRef.
-     * Decoupling vis_* from the hook thread is what allows PairIP-protected
-     * apps to not flag jnilog as latency-anomalous on JNI dispatch. */
+    /* EV_OBJ_RETURN: jobject return value to be rendered off-thread. */
     EV_OBJ_RETURN = 4,
+    /* EV_FIELD_ACCESS: Get/Set Field event (instance or static).  Carries
+     * a typed receiver + typed value, both potentially with deferred-render
+     * placeholders pulled out of the TLS sidecar. */
+    EV_FIELD_ACCESS = 5,
 };
 
 /* Initialize the socketpair.  Called once from bridge_init.  Returns 0 on
@@ -79,6 +78,25 @@ int  event_pipe_render_obj(
         int *out_kind,
         char **out_str,
         char **out_extra);
+
+/* TLS-side sidecar for per-event render refs.  Each event's encoded_args /
+ * receiver_str / receiver_extra strings may contain "\x1A<n>" markers (2-byte
+ * placeholders) — the Go consumer substitutes each marker with a fully
+ * formatted chunk produced by vis_*ing the corresponding ref on the consumer's
+ * JNIEnv*.
+ *
+ * Sidecar lifecycle:
+ *   1. hot path: defer_render_push(env, obj) for each object to render
+ *      → NewGlobalRef + record in TLS, returns slot index 0..7 (or -1 on full)
+ *   2. encoder writes "\x1A<slot>" placeholder where the rendered chunk
+ *      would have appeared
+ *   3. event_pipe_emit_* picks up the TLS refs, appends them to the
+ *      datagram, then clears the TLS state
+ */
+#define EVENT_PIPE_MAX_REFS 8
+
+int  event_pipe_defer_render_push(void *env, void *obj);
+void event_pipe_render_refs_reset(void);
 
 /* Hot-path emits.  Each builds a single packed datagram and sends it on
  * the writer fd.  Returns 0 on success, -1 if event_pipe is disabled or
@@ -109,5 +127,17 @@ int  event_pipe_emit_lookup(
 int  event_pipe_emit_obj_return(
         uint64_t call_id, int32_t offset,
         uintptr_t gref, const char *name);
+
+/* EV_FIELD_ACCESS: route the formerly-cgo goJNIFieldCallback through the
+ * socket so PairIP doesn't observe per-event cgo from Set/Get*Field hooks
+ * (these are SetStaticObjectField's volume). */
+int  event_pipe_emit_field_access(
+        int32_t offset, const char *name,
+        int receiver_kind,
+        const char *receiver_str, const char *receiver_extra,
+        const char *field_name,
+        int value_kind, uintptr_t value_raw,
+        const char *value_str, const char *value_extra,
+        const char *caller);
 
 #endif /* JNILOG_EVENT_PIPE_H */

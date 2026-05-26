@@ -36,10 +36,11 @@ const (
 	eventMagic         = 0x4A4E4945 // 'JNIE'
 	eventHdrFixedBytes = 32
 
-	evCall      = 1
-	evReturn    = 2
-	evLookup    = 3
-	evObjReturn = 4
+	evCall        = 1
+	evReturn      = 2
+	evLookup      = 3
+	evObjReturn   = 4
+	evFieldAccess = 5
 )
 
 // consumerEnv is the JNIEnv* the consumer goroutine owns (after
@@ -114,10 +115,27 @@ func dispatchEvent(data []byte) {
 	midOrRaw := binary.LittleEndian.Uint64(data[24:32])
 
 	// Parse the N length-prefixed strings.
-	strs, ok := parseStrings(data[eventHdrFixedBytes:], nstrings)
+	strs, nstrBytes, ok := parseStringsCount(data[eventHdrFixedBytes:], nstrings)
 	if !ok {
 		logNativeWarn(fmt.Sprintf("event_pipe malformed strings (type=%d nstrings=%d)", eventType, nstrings))
 		return
+	}
+	// Parse the sidecar (nrefs + refs).  If present, each "\x1A<n>" marker in
+	// any string slot is substituted with the rendered chunk for ref n.
+	sidecarStart := eventHdrFixedBytes + nstrBytes
+	if sidecarStart < len(data) {
+		nrefs := int(data[sidecarStart])
+		refsStart := sidecarStart + 1
+		if refsStart+nrefs*8 <= len(data) && nrefs > 0 {
+			rendered := make([]string, nrefs)
+			for i := 0; i < nrefs; i++ {
+				gref := uintptr(binary.LittleEndian.Uint64(data[refsStart+i*8 : refsStart+(i+1)*8]))
+				rendered[i] = renderRefChunk(gref)
+			}
+			for i := range strs {
+				strs[i] = substitutePlaceholders(strs[i], rendered)
+			}
+		}
 	}
 
 	switch eventType {
@@ -141,6 +159,15 @@ func dispatchEvent(data []byte) {
 			return
 		}
 		dispatchObjReturn(callID, offset, uintptr(midOrRaw), strs[0])
+	case evFieldAccess:
+		if len(strs) != 7 {
+			return
+		}
+		// strs: name, receiver_str, receiver_extra, field_name,
+		//       value_str, value_extra, caller
+		receiver := decodeSingleReceiver(receiverKind, strs[1], strs[2])
+		value := buildReturnValue(retKind, uintptr(midOrRaw), strs[4], strs[5])
+		emitFieldAccess(offset, strs[0], receiver, strs[3], value, strs[6])
 	default:
 		logNativeWarn(fmt.Sprintf("event_pipe unknown event type=%d", eventType))
 	}
@@ -192,21 +219,89 @@ func dispatchObjReturn(callID uint64, offset int, gref uintptr, name string) {
 }
 
 func parseStrings(buf []byte, n int) ([]string, bool) {
+	out, _, ok := parseStringsCount(buf, n)
+	return out, ok
+}
+
+// parseStringsCount returns the strings AND the byte count they consumed,
+// so the caller can locate the sidecar that follows.
+func parseStringsCount(buf []byte, n int) ([]string, int, bool) {
 	out := make([]string, 0, n)
 	pos := 0
 	for i := 0; i < n; i++ {
 		if pos+2 > len(buf) {
-			return nil, false
+			return nil, 0, false
 		}
 		l := int(binary.LittleEndian.Uint16(buf[pos : pos+2]))
 		pos += 2
 		if pos+l > len(buf) {
-			return nil, false
+			return nil, 0, false
 		}
 		out = append(out, string(buf[pos:pos+l]))
 		pos += l
 	}
-	return out, true
+	return out, pos, true
+}
+
+// renderRefChunk: render a single object globalref via the consumer thread's
+// JNIEnv* and return the "X\x01str[\x03extra]\x02" chunk that the
+// _log_obj_arg_call encoder would have produced for it inline.
+func renderRefChunk(gref uintptr) string {
+	if consumerEnv == nil || gref == 0 {
+		return "p\x01null\x02"
+	}
+	var (
+		cKind  C.int
+		cStr   *C.char
+		cExtra *C.char
+	)
+	C.event_pipe_render_obj(consumerEnv, C.uintptr_t(gref), &cKind, &cStr, &cExtra)
+	str := ""
+	extra := ""
+	if cStr != nil {
+		str = C.GoString(cStr)
+		C.free(unsafe.Pointer(cStr))
+	}
+	if cExtra != nil {
+		extra = C.GoString(cExtra)
+		C.free(unsafe.Pointer(cExtra))
+	}
+	var sig byte
+	switch int(cKind) {
+	case 10: // WIRE_KIND_STRING
+		sig = 's'
+	case 11: // WIRE_KIND_CLASS
+		sig = 'c'
+	case 12: // WIRE_KIND_OBJECT
+		sig = 'L'
+	default:
+		return "p\x01null\x02"
+	}
+	if extra != "" {
+		return string(sig) + "\x01" + str + "\x03" + extra + "\x02"
+	}
+	return string(sig) + "\x01" + str + "\x02"
+}
+
+// substitutePlaceholders replaces every "\x1A<digit>" marker with the
+// corresponding rendered chunk.
+func substitutePlaceholders(s string, rendered []string) string {
+	if len(rendered) == 0 || len(s) < 2 {
+		return s
+	}
+	out := make([]byte, 0, len(s)+64)
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\x1A' && i+1 < len(s) {
+			d := s[i+1]
+			if d >= '0' && d < '0'+byte(len(rendered)) {
+				out = append(out, rendered[d-'0']...)
+				i++ // skip the digit
+				continue
+			}
+		}
+		out = append(out, s[i])
+	}
+	return string(out)
 }
 
 func dispatchCall(callID uint64, offset int, receiverKind int, mid uintptr, strs []string) {

@@ -1,4 +1,5 @@
 #include "hook_internal.h"
+#include "event_pipe.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -74,63 +75,26 @@ static inline void _log_ptr_arg_call(int slot, const char *name,
 } while(0)
 
 /*
- * _log_obj_call — resolve a jobject to class/toString for the args field.
+ * _log_obj_arg_call — emit a one-jobject-arg call event with vis_* deferred.
+ * Writes a "\x1A<slot>" placeholder instead of the rendered chunk; the Go
+ * consumer renders via vis_* on its attached JNIEnv* and substitutes.  Saves
+ * 3-5 JNI calls per logged event in exchange for one NewGlobalRef.
  */
 static inline void _log_obj_arg_call(int slot, const char *name,
                                       JNIEnv *env, void *obj,
                                       const char *caller_str) {
-    int kind = WIRE_KIND_NULL;
-    char *str = NULL, *extra = NULL;
-    if (obj) {
-        if (vis_is_string(env, obj)) {
-            kind = WIRE_KIND_STRING;
-            str  = vis_string_value_raw(env, obj);
-        } else if (vis_is_class(env, obj)) {
-            kind = WIRE_KIND_CLASS;
-            str  = vis_class_name(env, obj);
-        } else {
-            kind   = WIRE_KIND_OBJECT;
-            str    = vis_object_class_name(env, obj);
-            extra  = vis_object_tostring(env, obj);
-        }
-    }
-    /* Encode single arg: sigChar \x01 val [\x03 extra] \x02
-     * Use 'L' for object, 's' for string, 'c' for class (matches vis_encode_typed_args). */
-    char enc[1024];
-    enc[0] = '\0';
-    /* Leave room for trailing \x02 + NUL — write-cap below uses cap-2. */
-    const int cap = (int)sizeof(enc);
-    const int max_payload = cap - 2;
-    char sig_ch = (kind == WIRE_KIND_STRING) ? 's'
-                : (kind == WIRE_KIND_CLASS)  ? 'c'
-                : (kind == WIRE_KIND_NULL)   ? 'p'
-                :                              'L';
-    if (kind == WIRE_KIND_NULL) {
+    char enc[64];
+    if (!obj) {
         snprintf(enc, sizeof(enc), "p\x01" "null\x02");
     } else {
-        int pos = 0;
-        if (pos < max_payload) enc[pos++] = sig_ch;
-        if (pos < max_payload) enc[pos++] = '\x01';
-        if (str) {
-            int slen = (int)strlen(str);
-            int room = max_payload - pos;
-            if (room < 0) room = 0;
-            if (slen > room) slen = room;
-            if (slen > 0) { memcpy(enc + pos, str, (size_t)slen); pos += slen; }
+        int n = event_pipe_defer_render_push(env, obj);
+        if (n < 0) {
+            snprintf(enc, sizeof(enc), "p\x01" "null\x02");
+        } else {
+            snprintf(enc, sizeof(enc), "\x1A%c", '0' + n);
         }
-        if (extra && pos < max_payload) {
-            enc[pos++] = '\x03';
-            int elen = (int)strlen(extra);
-            int room = max_payload - pos;
-            if (room < 0) room = 0;
-            if (elen > room) elen = room;
-            if (elen > 0) { memcpy(enc + pos, extra, (size_t)elen); pos += elen; }
-        }
-        if (pos < cap - 1) enc[pos++] = '\x02';
-        enc[pos] = '\0';
     }
     log_jni_call(slot, name, WIRE_KIND_NULL, "", "", "", name, enc, 0, caller_str);
-    free(str); free(extra);
 }
 #define LOG_OBJ_CALL(Env, Slot, Name, Obj, Caller) do { \
     char _cs[192]; address_of_r(Caller, _cs, sizeof(_cs)); \

@@ -314,16 +314,9 @@ void log_jni_field_access(
         const char* caller) {
     if (!logging_ready_fast()) return;
     if (!config_is_allowed(name)) return;
-    goJNIFieldCallback(
-        offset,
-        (char*)(name           ? name           : ""),
-        receiver_kind,
-        (char*)(receiver_str   ? receiver_str   : ""),
-        (char*)(receiver_extra ? receiver_extra : ""),
-        (char*)(field_name     ? field_name     : ""),
-        value_kind,
-        value_raw,
-        (char*)(value_str      ? value_str      : ""),
-        (char*)(value_extra    ? value_extra    : ""),
-        (char*)(caller         ? caller         : ""));
+    event_pipe_emit_field_access(offset, name,
+                                 receiver_kind, receiver_str, receiver_extra,
+                                 field_name,
+                                 value_kind, value_raw, value_str, value_extra,
+                                 caller);
 }

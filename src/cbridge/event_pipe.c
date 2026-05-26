@@ -50,6 +50,28 @@ static int g_writer_fd  = -1;
 static int g_reader_fd  = -1;
 static pthread_mutex_t g_send_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Per-thread sidecar for deferred-render refs. */
+struct tls_render_refs {
+    uint8_t   nrefs;
+    uintptr_t refs[EVENT_PIPE_MAX_REFS];
+};
+static __thread struct tls_render_refs g_tls_refs = {0};
+
+int event_pipe_defer_render_push(void *env, void *obj) {
+    if (!env || !obj) return -1;
+    if (g_tls_refs.nrefs >= EVENT_PIPE_MAX_REFS) return -1;
+    JNIEnv *je = (JNIEnv*)env;
+    void *gref = (void*)(*je)->NewGlobalRef(je, obj);
+    if (!gref) return -1;
+    int slot = g_tls_refs.nrefs++;
+    g_tls_refs.refs[slot] = (uintptr_t)gref;
+    return slot;
+}
+
+void event_pipe_render_refs_reset(void) {
+    g_tls_refs.nrefs = 0;
+}
+
 /* ── little-endian writers (no host-byte-order assumptions) ─────────── */
 static inline void put_u8 (uint8_t  *p, size_t off, uint8_t  v)  { p[off] = v; }
 static inline void put_u16(uint8_t  *p, size_t off, uint16_t v)  { p[off]=v; p[off+1]=v>>8; }
@@ -71,6 +93,25 @@ static int append_str(uint8_t *buf, size_t *pos, size_t cap, const char *s) {
     if (len) memcpy(buf + *pos + 2, s, len);
     *pos += 2 + len;
     return 0;
+}
+
+/* Append the TLS sidecar refs (if any) to the datagram and clear it.
+ * Sidecar wire layout: 1 byte nrefs, then nrefs × 8 bytes gref.  Returns
+ * the new pos, or 0 on overflow (caller treats as send failure).  Always
+ * resets the TLS sidecar regardless of success/failure to avoid leaks. */
+static size_t append_render_refs(uint8_t *buf, size_t pos, size_t cap) {
+    uint8_t n = g_tls_refs.nrefs;
+    if (pos + 1 + (size_t)n * 8 > cap) {
+        event_pipe_render_refs_reset();
+        return 0;
+    }
+    buf[pos++] = n;
+    for (int i = 0; i < (int)n; i++) {
+        put_u64(buf, pos, (uint64_t)g_tls_refs.refs[i]);
+        pos += 8;
+    }
+    event_pipe_render_refs_reset();
+    return pos;
 }
 
 /* ── header build ────────────────────────────────────────────────────── */
@@ -150,7 +191,12 @@ int event_pipe_emit_call(
         append_str(buf, &pos, sizeof(buf), class_name)      ||
         append_str(buf, &pos, sizeof(buf), method_name)     ||
         append_str(buf, &pos, sizeof(buf), encoded_args)    ||
-        append_str(buf, &pos, sizeof(buf), caller)) return -1;
+        append_str(buf, &pos, sizeof(buf), caller)) {
+        event_pipe_render_refs_reset();
+        return -1;
+    }
+    pos = append_render_refs(buf, pos, sizeof(buf));
+    if (pos == 0) return -1;
     return send_record(buf, pos);
 }
 
@@ -166,7 +212,12 @@ int event_pipe_emit_return(
                              offset, call_id, (uint64_t)ret_raw);
     if (append_str(buf, &pos, sizeof(buf), name)     ||
         append_str(buf, &pos, sizeof(buf), ret_str)  ||
-        append_str(buf, &pos, sizeof(buf), ret_extra)) return -1;
+        append_str(buf, &pos, sizeof(buf), ret_extra)) {
+        event_pipe_render_refs_reset();
+        return -1;
+    }
+    pos = append_render_refs(buf, pos, sizeof(buf));
+    if (pos == 0) return -1;
     return send_record(buf, pos);
 }
 
@@ -184,7 +235,43 @@ int event_pipe_emit_lookup(
         append_str(buf, &pos, sizeof(buf), name)        ||
         append_str(buf, &pos, sizeof(buf), sig)         ||
         append_str(buf, &pos, sizeof(buf), class_name)  ||
-        append_str(buf, &pos, sizeof(buf), caller)) return -1;
+        append_str(buf, &pos, sizeof(buf), caller)) {
+        event_pipe_render_refs_reset();
+        return -1;
+    }
+    pos = append_render_refs(buf, pos, sizeof(buf));
+    if (pos == 0) return -1;
+    return send_record(buf, pos);
+}
+
+int event_pipe_emit_field_access(
+        int32_t offset, const char *name,
+        int receiver_kind,
+        const char *receiver_str, const char *receiver_extra,
+        const char *field_name,
+        int value_kind, uintptr_t value_raw,
+        const char *value_str, const char *value_extra,
+        const char *caller)
+{
+    uint8_t buf[EVENT_MAX_BYTES];
+    /* Pack receiver_kind in the "receiver_kind" header byte and value_kind in
+     * the "ret_kind" byte. value_raw goes in the mid_or_raw slot. */
+    size_t pos = put_header(buf, EV_FIELD_ACCESS,
+                            (uint8_t)receiver_kind, (uint8_t)value_kind,
+                            /* nstrings = */ 6,
+                            offset, 0, (uint64_t)value_raw);
+    if (append_str(buf, &pos, sizeof(buf), name)            ||
+        append_str(buf, &pos, sizeof(buf), receiver_str)    ||
+        append_str(buf, &pos, sizeof(buf), receiver_extra)  ||
+        append_str(buf, &pos, sizeof(buf), field_name)      ||
+        append_str(buf, &pos, sizeof(buf), value_str)       ||
+        append_str(buf, &pos, sizeof(buf), value_extra)     ||
+        append_str(buf, &pos, sizeof(buf), caller)) {
+        event_pipe_render_refs_reset();
+        return -1;
+    }
+    pos = append_render_refs(buf, pos, sizeof(buf));
+    if (pos == 0) return -1;
     return send_record(buf, pos);
 }
 
@@ -197,7 +284,12 @@ int event_pipe_emit_obj_return(
                              0, 0,
                              /* nstrings = */ 1,
                              offset, call_id, (uint64_t)gref);
-    if (append_str(buf, &pos, sizeof(buf), name)) return -1;
+    if (append_str(buf, &pos, sizeof(buf), name)) {
+        event_pipe_render_refs_reset();
+        return -1;
+    }
+    pos = append_render_refs(buf, pos, sizeof(buf));
+    if (pos == 0) return -1;
     return send_record(buf, pos);
 }
 
