@@ -36,11 +36,12 @@ const (
 	eventMagic         = 0x4A4E4945 // 'JNIE'
 	eventHdrFixedBytes = 32
 
-	evCall        = 1
-	evReturn      = 2
-	evLookup      = 3
-	evObjReturn   = 4
-	evFieldAccess = 5
+	evCall            = 1
+	evReturn          = 2
+	evLookup          = 3
+	evObjReturn       = 4
+	evFieldAccess     = 5
+	evRegisterNatives = 6
 )
 
 // consumerEnv is the JNIEnv* the consumer goroutine owns (after
@@ -184,6 +185,13 @@ func dispatchEvent(data []byte) {
 		receiver := decodeSingleReceiver(receiverKind, strs[1], strs[2])
 		value := buildReturnValue(retKind, uintptr(midOrRaw), strs[4], strs[5])
 		emitFieldAccess(offset, strs[0], receiver, strs[3], value, strs[6])
+	case evRegisterNatives:
+		if len(strs) != 3 {
+			return
+		}
+		// strs: class_name, methods, caller; clazz rides in midOrRaw as an
+		// opaque display id.
+		emitRegisterNatives(uintptr(midOrRaw), strs[0], strs[1], strs[2])
 	default:
 		logNativeWarn(fmt.Sprintf("event_pipe unknown event type=%d", eventType))
 	}

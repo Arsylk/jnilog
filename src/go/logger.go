@@ -926,13 +926,6 @@ func emitInfo(msg string) {
 	writeLine(logLevelInfo, msg)
 }
 
-func emitInfoStdout(msg string) {
-	stdoutSink{}.Write(logEvent{
-		level: logLevelInfo,
-		line:  fmt.Sprintf("%s %s", "["+ansiGreen+"log"+ansiReset+"]", msg),
-	})
-}
-
 // ============================================================================
 // Utilities
 // ============================================================================

@@ -93,7 +93,6 @@ void log_native(int priority, const char* format, ...);
 void log_native_info(const char* format, ...);
 void log_native_warn(const char* format, ...);
 void log_native_error(const char* format, ...);
-void log_message(const char* format, ...);
 
 /* ============================================================================
  * Typed JNI event forwarding to Go.
@@ -241,56 +240,12 @@ typedef struct {
  * These extern declarations serve as forward references for standalone C
  * compilation (xmake) or for IDE tooling that doesn't process cgo headers.
  * ============================================================================ */
+/* NOTE: The per-JNI-event callbacks (goJNICallCallback / goJNIReturnCallback /
+ * goJNILookupCallback / goJNIRegisterNativesCallback / goJNIFieldCallback) have
+ * been replaced by the AF_UNIX event_pipe (see event_pipe.h).  C no longer
+ * crosses cgo per event — it serializes to the socket and a Go reader goroutine
+ * renders off-thread. */
 #ifndef _CGO_EXPORT_H_
-extern void goJNICallCallback(
-    uint64_t call_id,
-    int offset,
-    char* jni_name,
-    int receiver_kind,
-    char* receiver_str,
-    char* receiver_extra,
-    char* class_name,
-    char* method_name,
-    char* encoded_args,
-    uintptr_t mid,
-    char* caller);
-
-extern void goJNIReturnCallback(
-    uint64_t call_id,
-    int offset,
-    char* name,
-    int ret_kind,
-    uintptr_t ret_raw,
-    char* ret_str,
-    char* ret_extra);
-
-extern void goJNILookupCallback(
-    char* lookup_type,
-    char* name,
-    char* sig,
-    uintptr_t clazz,
-    char* class_name,
-    char* caller);
-
-extern void goJNIRegisterNativesCallback(
-    uintptr_t clazz,
-    char* class_name,
-    char* methods,
-    char* caller);
-
-extern void goJNIFieldCallback(
-    int offset,
-    char* name,
-    int receiver_kind,
-    char* receiver_str,
-    char* receiver_extra,
-    char* field_name,
-    int value_kind,
-    uintptr_t value_raw,
-    char* value_str,
-    char* value_extra,
-    char* caller);
-
 /* ============================================================================
  * Config query function signatures — Go cgo exports for C-side filter cache.
  *
@@ -320,7 +275,6 @@ extern void goLogNative(int priority, char* message);
 extern void goLogNativeInfo(char* message);
 extern void goLogNativeWarn(char* message);
 extern void goLogNativeError(char* message);
-extern void goLogCallback(char* message);
 #endif /* _CGO_EXPORT_H_ */
 
 /* Pure C range tracking (rangeset.c) */

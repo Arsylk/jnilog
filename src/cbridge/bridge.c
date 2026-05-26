@@ -51,18 +51,6 @@ void log_native_error(const char* format, ...) {
     va_end(args);
 }
 
-/* ── Dual-output logging ─────────────────────────────────────────────────── */
-
-void log_message(const char* format, ...) {
-    char buffer[1024];
-    va_list args;
-    va_start(args, format);
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-    goLogNative(kLogPriorityInfo, buffer);
-    if (goGetLoggingReady()) goLogCallback(buffer);
-}
-
 /* ── Bridge lifecycle ────────────────────────────────────────────────────── */
 
 static const char* (*art_field_get_name)(void*) = NULL;
@@ -293,7 +281,7 @@ void log_jni_register_natives(
 #undef REGNAT_APPEND
     buf[pos] = '\0';
 
-    goJNIRegisterNativesCallback((uintptr_t)clazz, (char*)class_name, buf, (char*)caller);
+    event_pipe_emit_register_natives((uintptr_t)clazz, class_name, buf, caller);
 }
 
 /*

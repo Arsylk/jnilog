@@ -60,22 +60,15 @@ func writeLogcat(priority int, message string) {
 	C.go_logcat_write(C.int(priority), cMessage)
 }
 
-//export goJNILogInit
+// goJNILogInit / goJNILogShutdown announce Go-runtime lifecycle.  Called only
+// from goBridgeInit / goBridgeCleanup on the Go side (no C caller), so they are
+// plain functions rather than cgo exports.
 func goJNILogInit() {
 	emitInfo("Go runtime initialized")
 }
 
-//export goJNILogShutdown
 func goJNILogShutdown() {
 	emitInfo("Go runtime shutdown")
-}
-
-//export goLogCallback
-func goLogCallback(message *C.char) {
-	if message == nil {
-		return
-	}
-	emitInfoStdout(C.GoString(message))
 }
 
 // callFrame holds everything captured at the JNI call site.
@@ -91,112 +84,18 @@ type callFrame struct {
 }
 
 // pendingCall holds a call-site frame plus its offset until the matching
-// return arrives via goJNIReturnCallback.
+// return arrives.  Calls and returns are paired by call_id and delivered via
+// the event_pipe socket reader (see event_pipe.go: dispatchCall/dispatchReturn).
 type pendingCall struct {
 	frame  *callFrame
 	offset int
 }
 
 // pendingCalls is keyed by the call_id assigned in C (atomic uint64 counter,
-// stashed per-thread on the C side, passed through both callbacks).  Using a
-// per-call unique key avoids the per-tid stack push/pop pattern that the
+// stashed per-thread on the C side, carried in the EV_CALL/EV_RETURN records).
+// A per-call unique key avoids the per-tid stack push/pop pattern that the
 // previous design needed a global Mutex for.
 var pendingCalls sync.Map // map[uint64]*pendingCall
-
-//export goJNICallCallback
-func goJNICallCallback(
-	callID C.uint64_t,
-	offset C.int,
-	jniName *C.char,
-	receiverKind C.int,
-	receiverStr *C.char,
-	receiverExtra *C.char,
-	className *C.char,
-	methodName *C.char,
-	encodedArgs *C.char,
-	mid C.uintptr_t,
-	caller *C.char,
-) {
-	receiver := decodeSingleReceiver(int(receiverKind), C.GoString(receiverStr), C.GoString(receiverExtra))
-	args := decodeArgs(C.GoString(encodedArgs))
-	pendingCalls.Store(uint64(callID), &pendingCall{
-		offset: int(offset),
-		frame: &callFrame{
-			jniName:    C.GoString(jniName),
-			mid:        uintptr(mid),
-			className:  normalizeDots(C.GoString(className)),
-			methodName: C.GoString(methodName),
-			receiver:   receiver,
-			args:       args,
-			caller:     C.GoString(caller),
-		},
-	})
-}
-
-//export goJNIReturnCallback
-func goJNIReturnCallback(
-	callID C.uint64_t,
-	offset C.int,
-	name *C.char,
-	retKind C.int,
-	retRaw C.uintptr_t,
-	retStr *C.char,
-	retExtra *C.char,
-) {
-	v, ok := pendingCalls.LoadAndDelete(uint64(callID))
-	if !ok {
-		// No matching call (e.g. log_jni_return fired without a prior
-		// log_jni_call — common for void/passthrough hook bodies).
-		// Emit as standalone return for those that have a payload.
-		result := buildReturnValue(int(retKind), uintptr(retRaw),
-			C.GoString(retStr), C.GoString(retExtra))
-		emitStandaloneReturn(int(offset), C.GoString(name), result)
-		return
-	}
-	pc := v.(*pendingCall)
-	result := buildReturnValue(int(retKind), uintptr(retRaw),
-		C.GoString(retStr), C.GoString(retExtra))
-	emitCallFull(pc.offset, pc.frame, result)
-}
-
-//export goJNILookupCallback
-func goJNILookupCallback(lookupType *C.char, name *C.char, sig *C.char, clazz C.uintptr_t, className *C.char, caller *C.char) {
-	emitJNILookup(
-		C.GoString(lookupType),
-		C.GoString(name),
-		C.GoString(sig),
-		uintptr(clazz),
-		C.GoString(className),
-		C.GoString(caller),
-	)
-}
-
-//export goJNIRegisterNativesCallback
-func goJNIRegisterNativesCallback(clazz C.uintptr_t, className *C.char, methods *C.char, caller *C.char) {
-	emitRegisterNatives(uintptr(clazz), C.GoString(className), C.GoString(methods), C.GoString(caller))
-}
-
-// goJNIFieldCallback handles Get/SetField and Get/SetStaticField.
-//
-//export goJNIFieldCallback
-func goJNIFieldCallback(
-	offset C.int,
-	name *C.char,
-	receiverKind C.int,
-	receiverStr *C.char,
-	receiverExtra *C.char,
-	fieldName *C.char,
-	valueKind C.int,
-	valueRaw C.uintptr_t,
-	valueStr *C.char,
-	valueExtra *C.char,
-	caller *C.char,
-) {
-	receiver := decodeSingleReceiver(int(receiverKind), C.GoString(receiverStr), C.GoString(receiverExtra))
-	value := buildReturnValue(int(valueKind), uintptr(valueRaw), C.GoString(valueStr), C.GoString(valueExtra))
-
-	emitFieldAccess(int(offset), C.GoString(name), receiver, C.GoString(fieldName), value, C.GoString(caller))
-}
 
 //export goLogNative
 func goLogNative(priority C.int, message *C.char) {

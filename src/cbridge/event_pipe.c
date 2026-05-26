@@ -81,18 +81,24 @@ static inline void put_u64(uint8_t  *p, size_t off, uint64_t v)  {
 }
 static inline void put_i32(uint8_t  *p, size_t off, int32_t  v)  { put_u32(p, off, (uint32_t)v); }
 
-/* Append a length-prefixed string to buf at *pos.  s may be NULL → treated as
- * empty string.  Truncates at EV_STR_MAX_BYTES.  Returns 0 on success or -1
- * if the buffer would overflow. */
-static int append_str(uint8_t *buf, size_t *pos, size_t cap, const char *s) {
+/* Append a length-prefixed string to buf at *pos, truncating at max_bytes.
+ * s may be NULL → treated as empty string.  Returns 0 on success or -1 if the
+ * buffer would overflow. */
+static int append_str_max(uint8_t *buf, size_t *pos, size_t cap,
+                          const char *s, size_t max_bytes) {
     if (!s) s = "";
     size_t len = strlen(s);
-    if (len > EV_STR_MAX_BYTES) len = EV_STR_MAX_BYTES;
+    if (len > max_bytes) len = max_bytes;
     if (*pos + 2 + len > cap) return -1;
     put_u16(buf, *pos, (uint16_t)len);
     if (len) memcpy(buf + *pos + 2, s, len);
     *pos += 2 + len;
     return 0;
+}
+
+/* Default-cap append (EV_STR_MAX_BYTES). */
+static int append_str(uint8_t *buf, size_t *pos, size_t cap, const char *s) {
+    return append_str_max(buf, pos, cap, s, EV_STR_MAX_BYTES);
 }
 
 /* Append the TLS sidecar refs (if any) to the datagram and clear it.
@@ -266,6 +272,29 @@ int event_pipe_emit_field_access(
         append_str(buf, &pos, sizeof(buf), field_name)      ||
         append_str(buf, &pos, sizeof(buf), value_str)       ||
         append_str(buf, &pos, sizeof(buf), value_extra)     ||
+        append_str(buf, &pos, sizeof(buf), caller)) {
+        event_pipe_render_refs_reset();
+        return -1;
+    }
+    pos = append_render_refs(buf, pos, sizeof(buf));
+    if (pos == 0) return -1;
+    return send_record(buf, pos);
+}
+
+int event_pipe_emit_register_natives(
+        uintptr_t clazz,
+        const char *class_name, const char *methods, const char *caller)
+{
+    uint8_t buf[EVENT_MAX_BYTES];
+    size_t  pos = put_header(buf, EV_REGISTER_NATIVES,
+                             0, 0,
+                             /* nstrings = */ 3,
+                             0, 0, (uint64_t)clazz);
+    /* methods is the pre-built "name sig @ptr, ..." list (bounded at 2048 by
+     * the hook-thread builder); allow the full list so RegisterNatives output
+     * matches the old cgo path byte-for-byte rather than clipping at 512. */
+    if (append_str(buf, &pos, sizeof(buf), class_name)             ||
+        append_str_max(buf, &pos, sizeof(buf), methods, 2048)      ||
         append_str(buf, &pos, sizeof(buf), caller)) {
         event_pipe_render_refs_reset();
         return -1;

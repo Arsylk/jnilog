@@ -32,6 +32,8 @@
  *                method_name, encoded_args, caller        (7 strings)
  *   EV_RETURN  : name, ret_str, ret_extra                  (3 strings)
  *   EV_LOOKUP  : lookup_type, name, sig, class_name, caller (5 strings)
+ *   EV_REGISTER_NATIVES : class_name, methods, caller       (3 strings)
+ *                         (clazz pointer carried in mid_or_raw)
  */
 
 #ifndef JNILOG_EVENT_PIPE_H
@@ -51,6 +53,10 @@ enum jni_event_type {
      * a typed receiver + typed value, both potentially with deferred-render
      * placeholders pulled out of the TLS sidecar. */
     EV_FIELD_ACCESS = 5,
+    /* EV_REGISTER_NATIVES: RegisterNatives event.  The "methods" string is the
+     * pre-formatted "name sig @ptr, ..." list built on the hook thread; clazz
+     * rides in mid_or_raw purely as an opaque display id. */
+    EV_REGISTER_NATIVES = 6,
 };
 
 /* Initialize the socketpair.  Called once from bridge_init.  Returns 0 on
@@ -139,5 +145,11 @@ int  event_pipe_emit_field_access(
         int value_kind, uintptr_t value_raw,
         const char *value_str, const char *value_extra,
         const char *caller);
+
+/* EV_REGISTER_NATIVES: route the formerly-cgo goJNIRegisterNativesCallback
+ * through the socket.  methods is the caller-built "name sig @ptr, ..." list. */
+int  event_pipe_emit_register_natives(
+        uintptr_t clazz,
+        const char *class_name, const char *methods, const char *caller);
 
 #endif /* JNILOG_EVENT_PIPE_H */
