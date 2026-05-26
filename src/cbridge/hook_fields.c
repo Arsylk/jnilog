@@ -1,4 +1,5 @@
 #include "hook_internal.h"
+#include "event_pipe.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -28,7 +29,19 @@ static inline uintptr_t _field_float_raw(jfloat v)       { uint32_t u; memcpy(&u
 static inline int _field_double_kind(void)               { return (int)WIRE_KIND_DOUBLE; }
 static inline uintptr_t _field_double_raw(jdouble v)     { uintptr_t u; memcpy(&u, &v, sizeof(u)); return u; }
 
-/* Object Set*: resolve class name and toString before the call. */
+/* Object Set*: defer vis_* class/toString resolution to the Go consumer.
+ *
+ * NewGlobalRef the value, push onto the event_pipe TLS sidecar, write a
+ * "\x1A<n>" placeholder into *out_str — the consumer renders the gref on
+ * its own attached JNIEnv* and substitutes.  out_kind is set to a sentinel
+ * value (0xFE) the Go side recognises as "deferred"; raw still carries the
+ * original jobject pointer for display purposes.  Saves 4-5 JNI calls per
+ * Set/GetObjectField event in exchange for one NewGlobalRef.
+ *
+ * If the sidecar is full (>=8 refs already) or NewGlobalRef fails, fall
+ * back to in-thread rendering so the log line still has the data — same
+ * cost as the original implementation. */
+#define FIELD_KIND_DEFERRED_OBJECT 0xFE
 static inline void field_obj_parts(JNIEnv *env, jobject obj,
                                     int *out_kind, uintptr_t *out_raw,
                                     char **out_str, char **out_extra) {
@@ -36,6 +49,15 @@ static inline void field_obj_parts(JNIEnv *env, jobject obj,
     *out_extra = NULL;
     if (!obj) { *out_kind = WIRE_KIND_NULL; *out_raw = 0; return; }
     *out_raw = (uintptr_t)obj;
+    int slotn = event_pipe_defer_render_push(env, obj);
+    if (slotn >= 0) {
+        *out_kind = FIELD_KIND_DEFERRED_OBJECT;
+        char *ph = (char*)malloc(3);
+        if (ph) { ph[0] = '\x1A'; ph[1] = (char)('0' + slotn); ph[2] = '\0'; }
+        *out_str = ph;
+        return;
+    }
+    /* Sidecar full — fall back to in-thread render. */
     if (vis_is_string(env, obj)) {
         *out_kind = WIRE_KIND_STRING;
         *out_str  = vis_string_value(env, obj);

@@ -106,8 +106,11 @@ func eventPipeReadLoop(fd int) {
 // Layout matches event_pipe.h.
 func dispatchEvent(data []byte) {
 	eventType := data[4]
-	receiverKind := int(int8(data[5]))
-	retKind := int(int8(data[6]))
+	// Keep these UNSIGNED — sentinel values like 0xFE (deferred-object field
+	// kind) are intentionally above 127 and were losing their identity when
+	// sign-extended through int8.
+	receiverKind := int(data[5])
+	retKind := int(data[6])
 	nstrings := int(data[7])
 	offset := int(int32(binary.LittleEndian.Uint32(data[8:12])))
 	// data[12:16] reserved
@@ -165,6 +168,19 @@ func dispatchEvent(data []byte) {
 		}
 		// strs: name, receiver_str, receiver_extra, field_name,
 		//       value_str, value_extra, caller
+		//
+		// retKind == 0xFE (FIELD_KIND_DEFERRED_OBJECT) is a hook-side sentinel
+		// meaning "the value is an object — render it via vis_* on the
+		// consumer env".  The actual gref lives in midOrRaw at this point.
+		// The placeholder substitution above already swapped strs[4] for the
+		// "X\x01str[\x03extra]\x02" chunk, so we just need to convert it
+		// back into a kind+str+extra triple for buildReturnValue.
+		if retKind == 0xFE {
+			k, s, e := parseRenderedChunk(strs[4])
+			retKind = k
+			strs[4] = s
+			strs[5] = e
+		}
 		receiver := decodeSingleReceiver(receiverKind, strs[1], strs[2])
 		value := buildReturnValue(retKind, uintptr(midOrRaw), strs[4], strs[5])
 		emitFieldAccess(offset, strs[0], receiver, strs[3], value, strs[6])
@@ -281,6 +297,55 @@ func renderRefChunk(gref uintptr) string {
 		return string(sig) + "\x01" + str + "\x03" + extra + "\x02"
 	}
 	return string(sig) + "\x01" + str + "\x02"
+}
+
+// parseRenderedChunk takes a "X\x01str[\x03extra]\x02" chunk (the output
+// of renderRefChunk) and decomposes it back into kind + str + extra so the
+// consumer's typed-value builders can ingest it.  Used by EV_FIELD_ACCESS
+// when the value_kind sentinel is 0xFE (deferred object).
+func parseRenderedChunk(chunk string) (kind int, str string, extra string) {
+	if len(chunk) < 2 {
+		return 0, "", "" // WIRE_KIND_NULL
+	}
+	switch chunk[0] {
+	case 's':
+		kind = 10 // STRING
+	case 'c':
+		kind = 11 // CLASS
+	case 'L':
+		kind = 12 // OBJECT
+	case 'p':
+		kind = 0 // NULL
+	default:
+		return 0, "", ""
+	}
+	// Strip leading "X\x01" and trailing "\x02"
+	if len(chunk) >= 3 && chunk[1] == '\x01' {
+		body := chunk[2:]
+		if len(body) > 0 && body[len(body)-1] == '\x02' {
+			body = body[:len(body)-1]
+		}
+		// Split body on "\x03" for L kind (class \x03 toString)
+		if idx := indexByte(body, '\x03'); idx >= 0 {
+			str = body[:idx]
+			extra = body[idx+1:]
+		} else {
+			str = body
+		}
+		if kind == 0 {
+			str = ""
+		}
+	}
+	return
+}
+
+func indexByte(s string, b byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
 }
 
 // substitutePlaceholders replaces every "\x1A<digit>" marker with the

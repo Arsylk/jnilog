@@ -103,58 +103,34 @@ static inline void _log_obj_arg_call(int slot, const char *name,
     set_reentrant_call(0); \
 } while(0)
 
-/* Two-object argument call (IsSameObject, etc.).
- * Every write is bounded against `cap-1` (leaving one byte for the trailing
- * NUL) so a long class name + toString from either object cannot overrun the
- * stack buffer. */
+/* Two-object argument call (IsSameObject, etc.).  Uses the same deferred-
+ * render placeholder scheme as _log_obj_arg_call: each object becomes a
+ * NewGlobalRef + "\x1A<n>" marker; the Go consumer renders + substitutes. */
 static inline void _log_obj2_arg_call(int slot, const char *name,
                                        JNIEnv *env, void *obj1, void *obj2,
                                        const char *caller_str) {
-    char enc[2048];
-    enc[0] = '\0';
-    const int cap = (int)sizeof(enc);
+    char enc[64];
     int pos = 0;
     void *objs[2] = {obj1, obj2};
     for (int i = 0; i < 2; i++) {
         void *o = objs[i];
-        char sig_ch; char *str = NULL, *extra = NULL;
         if (!o) {
-            sig_ch = 'p';
-        } else if (vis_is_string(env, o)) {
-            sig_ch = 's'; str = vis_string_value_raw(env, o);
-        } else if (vis_is_class(env, o)) {
-            sig_ch = 'c'; str = vis_class_name(env, o);
+            int n = snprintf(enc + pos, sizeof(enc) - pos, "p\x01" "null\x02");
+            if (n > 0) pos += n;
         } else {
-            sig_ch = 'L'; str = vis_object_class_name(env, o);
-            extra = vis_object_tostring(env, o);
-        }
-        if (pos < cap - 1) enc[pos++] = sig_ch;
-        if (pos < cap - 1) enc[pos++] = '\x01';
-        if (!o) {
-            int room = cap - 1 - pos;
-            int n = room < 4 ? room : 4;
-            if (n > 0) { memcpy(enc+pos, "null", (size_t)n); pos += n; }
-        } else {
-            if (str) {
-                int n = (int)strlen(str);
-                int room = cap - 1 - pos;
-                if (room < 0) room = 0;
-                if (n > room) n = room;
-                if (n > 0) { memcpy(enc+pos, str, (size_t)n); pos += n; }
-            }
-            if (extra && pos < cap - 1) {
-                enc[pos++] = '\x03';
-                int n = (int)strlen(extra);
-                int room = cap - 1 - pos;
-                if (room < 0) room = 0;
-                if (n > room) n = room;
-                if (n > 0) { memcpy(enc+pos, extra, (size_t)n); pos += n; }
+            int slotn = event_pipe_defer_render_push(env, o);
+            if (slotn < 0) {
+                int n = snprintf(enc + pos, sizeof(enc) - pos, "p\x01" "null\x02");
+                if (n > 0) pos += n;
+            } else {
+                if (pos + 2 < (int)sizeof(enc)) {
+                    enc[pos++] = '\x1A';
+                    enc[pos++] = (char)('0' + slotn);
+                    enc[pos] = '\0';
+                }
             }
         }
-        if (pos < cap - 1) enc[pos++] = '\x02';
-        free(str); free(extra);
     }
-    enc[pos] = '\0';
     log_jni_call(slot, name, WIRE_KIND_NULL, "", "", "", name, enc, 0, caller_str);
 }
 #define LOG_OBJ2_CALL(Env, Slot, Name, Obj1, Obj2, Caller) do { \
@@ -563,28 +539,17 @@ static void hooked_SetObjectArrayElement(JNIEnv *env, jobjectArray array,
     _pos += _w; \
 } while (0)
     ENC_APPEND("I\x01%d\x02", (int)index);
-    /* Encode the value being set — each record is self-delimiting via \x02 */
+    /* Encode the value being set — defer vis_* to the Go consumer via
+     * NewGlobalRef + "\x1A<n>" placeholder in the encoded_args. */
     if (!value) {
       ENC_APPEND("p\x01" "null\x02");
-    } else if (vis_is_string(env, value)) {
-      char *sv = vis_string_value_raw(env, value);
-      ENC_APPEND("s\x01%.200s\x02", sv ? sv : "");
-      free(sv);
-    } else if (vis_is_class(env, value)) {
-      char *cn = vis_class_name(env, value);
-      ENC_APPEND("c\x01%.200s\x02", cn ? cn : "");
-      free(cn);
     } else {
-      char *cn = vis_object_class_name(env, value);
-      char *ts = vis_object_tostring(env, value);
-      ENC_APPEND("L\x01%.200s", cn ? cn : "");
-      free(cn);
-      if (ts) {
-        if (_pos < (int)enc_cap - 1) enc[_pos++] = '\x03';
-        ENC_APPEND("%.200s", ts);
-        free(ts);
+      int slotn = event_pipe_defer_render_push(env, value);
+      if (slotn < 0) {
+        ENC_APPEND("p\x01" "null\x02");
+      } else {
+        ENC_APPEND("\x1A%c", '0' + slotn);
       }
-      if (_pos < (int)enc_cap - 1) enc[_pos++] = '\x02';
     }
 #undef ENC_APPEND
     enc[_pos] = '\0';
