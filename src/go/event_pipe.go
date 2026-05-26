@@ -372,6 +372,16 @@ func substitutePlaceholders(s string, rendered []string) string {
 func dispatchCall(callID uint64, offset int, receiverKind int, mid uintptr, strs []string) {
 	// Slot order: jni_name, receiver_str, receiver_extra, class_name,
 	//             method_name, encoded_args, caller
+	//
+	// receiverKind == 0xFE (deferred-object sentinel from hook_logging.c
+	// classify_object) means strs[1] holds an already-rendered chunk that
+	// needs decomposing back into kind/str/extra for decodeSingleReceiver.
+	if receiverKind == 0xFE {
+		k, s, e := parseRenderedChunk(strs[1])
+		receiverKind = k
+		strs[1] = s
+		strs[2] = e
+	}
 	receiver := decodeSingleReceiver(receiverKind, strs[1], strs[2])
 	args := decodeArgs(strs[5])
 	pendingCalls.Store(callID, &pendingCall{

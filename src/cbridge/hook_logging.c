@@ -13,6 +13,7 @@
  */
 
 #include "hook_internal.h"
+#include "event_pipe.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -34,16 +35,20 @@
  * Receiver encoding helpers
  * ============================================================================ */
 
+/* HOTPATH-DEFERRED: classify_object used to make 1-2 JNI calls per receiver.
+ * It's now caller-only — the deferred-object kind sentinel is what flows
+ * through the wire format; the Go consumer expands the rendered chunk into
+ * the real kind via parseRenderedChunk(). */
 static wire_kind_t classify_object(JNIEnv *env, void *obj) {
+    (void)env;
     if (obj == NULL) return WIRE_KIND_NULL;
-    if (vis_is_string(env, obj)) return WIRE_KIND_STRING;
-    if (vis_is_class(env, obj))  return WIRE_KIND_CLASS;
-    return WIRE_KIND_OBJECT;
+    return (wire_kind_t)0xFE;   /* deferred — see field_obj_parts comment */
 }
 
 /*
- * fill_object_strings — resolves class name and toString for a jobject.
- * Returns heap strings; caller must free both.
+ * fill_object_strings — defer vis_* to consumer.  NewGlobalRef + sidecar push
+ * + "\x1A<n>" placeholder.  Falls back to in-thread render if the sidecar is
+ * full (>=8 refs already in this event).
  */
 static void fill_object_strings(JNIEnv *env, void *obj,
                                 char **out_str, char **out_extra) {
@@ -51,20 +56,21 @@ static void fill_object_strings(JNIEnv *env, void *obj,
     *out_extra = NULL;
     if (!obj || !env) return;
 
-    wire_kind_t k = classify_object(env, obj);
-    switch (k) {
-    case WIRE_KIND_STRING:
+    int slotn = event_pipe_defer_render_push(env, obj);
+    if (slotn >= 0) {
+        char *ph = (char*)malloc(3);
+        if (ph) { ph[0] = '\x1A'; ph[1] = (char)('0' + slotn); ph[2] = '\0'; }
+        *out_str = ph;
+        return;
+    }
+    /* Sidecar full — in-thread fallback. */
+    if (vis_is_string(env, obj)) {
         *out_str = vis_string_value_raw(env, obj);
-        break;
-    case WIRE_KIND_CLASS:
-        *out_str = vis_class_name(env, obj);   /* slash-separated */
-        break;
-    case WIRE_KIND_OBJECT:
+    } else if (vis_is_class(env, obj)) {
+        *out_str = vis_class_name(env, obj);
+    } else {
         *out_str   = vis_object_class_name(env, obj);
         *out_extra = vis_object_tostring_safe(env, obj, *out_str);
-        break;
-    default:
-        break;
     }
 }
 
