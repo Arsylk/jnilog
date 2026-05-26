@@ -293,9 +293,8 @@ static jmethodID hooked_GetMethodID(JNIEnv *env, jclass clazz, const char *name,
   if (should_log) {
     set_reentrant_call(1);
     char cs[192]; address_of_r(caller, cs, sizeof(cs));
-    char *cn = vis_class_name(env, clazz);
-    log_jni_lookup("GetMethodID", name, sig, clazz, cn, cs);
-    free(cn); set_reentrant_call(0);
+    log_jni_lookup_deferred(env, "GetMethodID", name, sig, clazz, cs);
+    set_reentrant_call(0);
   }
   return result;
 }
@@ -314,9 +313,8 @@ static jmethodID hooked_GetStaticMethodID(JNIEnv *env, jclass clazz, const char 
   if (should_log) {
     set_reentrant_call(1);
     char cs[192]; address_of_r(caller, cs, sizeof(cs));
-    char *cn = vis_class_name(env, clazz);
-    log_jni_lookup("GetStaticMethodID", name, sig, clazz, cn, cs);
-    free(cn); set_reentrant_call(0);
+    log_jni_lookup_deferred(env, "GetStaticMethodID", name, sig, clazz, cs);
+    set_reentrant_call(0);
   }
   return result;
 }
@@ -335,9 +333,8 @@ static jfieldID hooked_GetFieldID(JNIEnv *env, jclass clazz, const char *name, c
   if (should_log) {
     set_reentrant_call(1);
     char cs[192]; address_of_r(caller, cs, sizeof(cs));
-    char *cn = vis_class_name(env, clazz);
-    log_jni_lookup("GetFieldID", name, sig, clazz, cn, cs);
-    free(cn); set_reentrant_call(0);
+    log_jni_lookup_deferred(env, "GetFieldID", name, sig, clazz, cs);
+    set_reentrant_call(0);
   }
   return result;
 }
@@ -356,9 +353,8 @@ static jfieldID hooked_GetStaticFieldID(JNIEnv *env, jclass clazz, const char *n
   if (should_log) {
     set_reentrant_call(1);
     char cs[192]; address_of_r(caller, cs, sizeof(cs));
-    char *cn = vis_class_name(env, clazz);
-    log_jni_lookup("GetStaticFieldID", name, sig, clazz, cn, cs);
-    free(cn); set_reentrant_call(0);
+    log_jni_lookup_deferred(env, "GetStaticFieldID", name, sig, clazz, cs);
+    set_reentrant_call(0);
   }
   return result;
 }

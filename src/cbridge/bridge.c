@@ -228,6 +228,25 @@ void log_jni_lookup(
                            class_name, caller);
 }
 
+/* Deferred variant: NewGlobalRef the clazz so the Go consumer can render the
+ * class name off-thread using its own attached JNIEnv*.  Hooks should prefer
+ * this over log_jni_lookup wherever they currently call vis_class_name solely
+ * to feed log_jni_lookup. */
+void log_jni_lookup_deferred(
+        void* env,
+        const char* lookup_type,
+        const char* name,
+        const char* sig,
+        void* clazz,
+        const char* caller) {
+    if (!logging_ready_fast()) return;
+    if (!config_is_allowed(lookup_type)) return;
+    JNIEnv *je = (JNIEnv*)env;
+    void *gref = (clazz && je) ? (void*)(*je)->NewGlobalRef(je, clazz) : NULL;
+    /* Empty class_name + non-zero clazz tells the consumer to render. */
+    event_pipe_emit_lookup((uintptr_t)gref, lookup_type, name, sig, "", caller);
+}
+
 /*
  * log_jni_register_natives — RegisterNatives event.
  * Formats the method list as a comma-separated "name sig @ptr" string,

@@ -136,6 +136,18 @@ void log_jni_return(
     const char* ret_str,
     const char* ret_extra);
 
+/* log_jni_lookup_deferred — defer class_name resolution to the Go consumer.
+ * Pass the LIVE jclass (or jobject) from the hook; the function NewGlobalRef's
+ * it under the hood and ships the gref over the pipe.  The consumer renders
+ * the class name on its own attached JNIEnv* and DeleteGlobalRef's. */
+void log_jni_lookup_deferred(
+    void* env,
+    const char* lookup_type,
+    const char* name,
+    const char* sig,
+    void* clazz,
+    const char* caller);
+
 void log_jni_lookup(
     const char* lookup_type,
     const char* name,

@@ -243,7 +243,32 @@ func dispatchReturn(callID uint64, offset int, retKind int, retRaw uintptr, strs
 
 func dispatchLookup(clazz uintptr, strs []string) {
 	// Slot order: lookup_type, name, sig, class_name, caller
-	emitJNILookup(strs[0], strs[1], strs[2], clazz, strs[3], strs[4])
+	// Empty class_name + non-zero clazz = deferred render: clazz is a
+	// NewGlobalRef'd jclass — call into vis_class_name on the consumer
+	// thread to resolve the name, then DeleteGlobalRef.  We keep the
+	// original gref pointer value in the `clazz` slot for display
+	// (emitJNILookup formats it as the "→ 0x...." identifier suffix);
+	// the gref itself is consumed by event_pipe_render_obj.
+	className := strs[3]
+	if className == "" && clazz != 0 && consumerEnv != nil {
+		var (
+			cKind  C.int
+			cStr   *C.char
+			cExtra *C.char
+		)
+		C.event_pipe_render_obj(consumerEnv, C.uintptr_t(clazz), &cKind, &cStr, &cExtra)
+		if cStr != nil {
+			className = C.GoString(cStr)
+			C.free(unsafe.Pointer(cStr))
+		}
+		if cExtra != nil {
+			C.free(unsafe.Pointer(cExtra))
+		}
+		// NOTE: clazz holds the pointer value of the (now-deleted) gref.
+		// We preserve it as-is — emitJNILookup uses it purely as an opaque
+		// display id, not for any JNI dispatch.
+	}
+	emitJNILookup(strs[0], strs[1], strs[2], clazz, className, strs[4])
 }
 
 // Silence unused-import warnings for the unsafe import (used implicitly by cgo).
