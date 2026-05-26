@@ -147,6 +147,22 @@ const char* art_get_field_name(void* field_id) {
 static uint64_t            g_call_id_counter = 0;
 static __thread uint64_t   tls_last_call_id  = 0;
 
+/* Cache goGetLoggingReady() at C-side after the first true return.  Once
+ * jnilog has handed off Go-side initialization to the user, the value never
+ * flips back to false, so a single cgo crossing is enough to know "ready
+ * forever".  Without this cache, every JNI hook event fires a cgo callback
+ * just to ask "is logging on?" — and on PairIP-protected apps that's enough
+ * cgo activity per second to trip the integrity VM. */
+static int g_logging_ready_cached = 0;
+static inline int logging_ready_fast(void) {
+    if (__atomic_load_n(&g_logging_ready_cached, __ATOMIC_ACQUIRE)) return 1;
+    if (goGetLoggingReady()) {
+        __atomic_store_n(&g_logging_ready_cached, 1, __ATOMIC_RELEASE);
+        return 1;
+    }
+    return 0;
+}
+
 void log_jni_call(
         int offset,
         const char* jni_name,
@@ -158,7 +174,7 @@ void log_jni_call(
         const char* encoded_args,
         uintptr_t mid,
         const char* caller) {
-    if (!goGetLoggingReady()) return;
+    if (!logging_ready_fast()) return;
     if (!config_is_allowed(jni_name)) return;
     uint64_t cid = __atomic_add_fetch(&g_call_id_counter, 1, __ATOMIC_RELAXED);
     tls_last_call_id = cid;
@@ -188,7 +204,7 @@ void log_jni_return(
         uintptr_t ret_raw,
         const char* ret_str,
         const char* ret_extra) {
-    if (!goGetLoggingReady()) return;
+    if (!logging_ready_fast()) return;
     if (!config_is_allowed(name)) return;
     uint64_t cid = tls_last_call_id;
     tls_last_call_id = 0;
@@ -213,7 +229,7 @@ void log_jni_lookup(
         void* clazz,
         const char* class_name,
         const char* caller) {
-    if (!goGetLoggingReady()) return;
+    if (!logging_ready_fast()) return;
     if (!config_is_allowed(lookup_type)) return;
     goJNILookupCallback(
         (char*)lookup_type,
@@ -236,7 +252,7 @@ void log_jni_register_natives(
         const JNINativeMethod* methods,
         int n_methods,
         const char* caller) {
-    if (!goGetLoggingReady()) return;
+    if (!logging_ready_fast()) return;
     if (!config_is_allowed("RegisterNatives")) return;
 
     /* Build a comma-separated "name sig @ptr" list, bounded against buf[2048].
@@ -289,7 +305,7 @@ void log_jni_field_access(
         const char* value_str,
         const char* value_extra,
         const char* caller) {
-    if (!goGetLoggingReady()) return;
+    if (!logging_ready_fast()) return;
     if (!config_is_allowed(name)) return;
     goJNIFieldCallback(
         offset,
