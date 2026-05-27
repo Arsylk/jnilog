@@ -165,6 +165,32 @@ int c_path_contains_package(const char *path) {
 }
 
 /* ====================================================================
+ * Own-library path (for self-exclusion in the /proc/self/maps fallback)
+ * ==================================================================== */
+
+/* The injector stages this payload under a random name inside the app sandbox
+ * (e.g. /data/data/<pkg>/.org.chromium.<hex>.tmp), so our on-disk path BOTH
+ * matches the package-name filter AND is not the literal "libjnilog" the name
+ * check looks for. The dl_iterate_phdr seed excludes us by load-base identity,
+ * but the /proc/self/maps fallback excluded only by name — so the renamed
+ * payload seeded its OWN executable segment as an app range and we logged every
+ * JNI call our formatter makes (observed: 99% of output was self-noise). Capture
+ * the real path via dladdr early, while our soinfo is still linked (the injector
+ * unlinks it shortly after dlopen returns), and exclude by it. */
+static char g_self_lib_path[512] = {0};
+
+static const char *self_lib_path(void) {
+  if (g_self_lib_path[0] == '\0') {
+    Dl_info info;
+    if (dladdr((void *)self_lib_path, &info) && info.dli_fname && info.dli_fname[0]) {
+      strncpy(g_self_lib_path, info.dli_fname, sizeof(g_self_lib_path) - 1);
+      g_self_lib_path[sizeof(g_self_lib_path) - 1] = '\0';
+    }
+  }
+  return g_self_lib_path;
+}
+
+/* ====================================================================
  * Exec range set
  * ==================================================================== */
 
@@ -444,6 +470,11 @@ static int c_seed_exec_ranges_from_proc_maps(void) {
     if (plen > 0 && path[plen-1] == '\n') path[plen-1] = '\0';
     if (path[0] == '\0') continue;
 
+    /* The kernel appends " (deleted)" once the injector unlinks our staged
+     * file; strip it so the self-path compare below matches dli_fname. */
+    char *deleted = strstr(path, " (deleted)");
+    if (deleted) *deleted = '\0';
+
     /* Skip system libraries — but for /proc/self/maps we use a simpler check
      * that doesn't exclude .odex (OAT files contain app code) */
     if (path[0] != '/') continue;
@@ -455,8 +486,11 @@ static int c_seed_exec_ranges_from_proc_maps(void) {
         strncmp(path, "/odm/", 5) == 0 ||
         strstr(path, "/bionic") != NULL) continue;
 
-    /* Skip our own payload */
+    /* Skip our own payload. The "libjnilog" name check misses the injector's
+     * stealth rename, so also exclude by our real path captured via dladdr. */
     if (strstr(path, "libjnilog") != NULL) continue;
+    const char *self = self_lib_path();
+    if (self[0] != '\0' && strcmp(path, self) == 0) continue;
 
     /* Check if path contains the package name. Use the locked snapshot
      * (pkg_snap) taken at the top of this function — reading
@@ -484,6 +518,11 @@ static int c_seed_exec_ranges_from_proc_maps(void) {
  * ==================================================================== */
 
 void c_init_range_tracking(void) {
+  /* Capture our own library path now, while our soinfo is still linked — the
+   * injector unlinks it shortly after dlopen returns. Used to exclude our own
+   * executable segment from the /proc/self/maps seed fallback. */
+  (void)self_lib_path();
+
   refresh_package_name_if_needed();
 
   pthread_mutex_lock(&g_range_pkg_lock);
