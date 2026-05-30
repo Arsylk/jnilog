@@ -171,6 +171,13 @@ static inline void _log_obj_ret(int slot, const char *name,
         log_jni_return(slot, name, WIRE_KIND_NULL, 0, "", "");
         return;
     }
+    /* Defer object rendering only when a consumer is attached to render + free
+     * the gref; otherwise emit a void-shaped return (no gref minted) so we never
+     * leak a ref the consumer will never drain (F1). */
+    if (!event_pipe_consumer_ready()) {
+        log_jni_return(slot, name, WIRE_KIND_NULL, 0, "", "");
+        return;
+    }
     /* NewGlobalRef: one JNI call, much cheaper than 4-5 vis_* JNI calls. */
     void *gref = (void*)(*env)->NewGlobalRef(env, obj);
     if (!gref) {
@@ -185,7 +192,11 @@ static inline void _log_obj_ret(int slot, const char *name,
     extern int event_pipe_emit_obj_return(uint64_t, int32_t, uintptr_t, const char*);
     uint64_t cid = tls_last_call_id;
     tls_last_call_id = 0;
-    event_pipe_emit_obj_return(cid, slot, (uintptr_t)gref, name ? name : "");
+    if (event_pipe_emit_obj_return(cid, slot, (uintptr_t)gref, name ? name : "") != 0) {
+        /* Datagram dropped — the consumer will never see (or free) this gref,
+         * so release it here. */
+        (*env)->DeleteGlobalRef(env, gref);
+    }
 }
 #define LOG_OBJ_RET(Env, Slot, Name, Obj) do { \
     set_reentrant_call(1); \

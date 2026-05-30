@@ -28,6 +28,7 @@ import (
 	"runtime"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -75,12 +76,24 @@ func eventPipeReadLoop(fd int) {
 	runtime.LockOSThread()
 	env := C.attach_consumer_thread()
 	if env == nil {
+		// Off-thread object rendering stays disabled.  The C side gates ALL
+		// deferred-gref creation on event_pipe_consumer_ready(), which we leave
+		// at 0 here, so no gref is ever minted that this loop could not free (F1).
 		logNativeWarn("event_pipe: failed to attach consumer thread to JVM; off-thread rendering disabled")
 	} else {
 		consumerEnv = unsafe.Pointer(env)
+		// Publish readiness AFTER consumerEnv is set (same goroutine), so the
+		// first deferred gref the hook side mints is guaranteed renderable here.
+		C.event_pipe_set_consumer_ready(1)
 		logNativeInfo(fmt.Sprintf("event_pipe consumer attached to JVM, env=%p", env))
+		go eventPipeDropMonitor()
 	}
 
+	// The reader runs for the lifetime of the process — there is no shutdown
+	// path by design.  It returns only on a hard read error (which does not
+	// happen for a process-lifetime AF_UNIX socketpair).  On that error we clear
+	// the consumer-ready gate so the hook side stops minting grefs we can no
+	// longer drain (F24).
 	buf := make([]byte, int(C.EVENT_PIPE_MAX_BYTES))
 	for {
 		n, err := syscall.Read(fd, buf)
@@ -88,7 +101,10 @@ func eventPipeReadLoop(fd int) {
 			if errors.Is(err, syscall.EINTR) {
 				continue
 			}
-			logNativeWarn(fmt.Sprintf("event_pipe read failed: %v — reader exiting", err))
+			C.event_pipe_set_consumer_ready(0)
+			consumerEnv = nil
+			logNativeWarn(fmt.Sprintf("event_pipe read failed: %v — reader exiting (drops=%d)",
+				err, uint64(C.event_pipe_drops())))
 			return
 		}
 		if n < eventHdrFixedBytes {
@@ -100,6 +116,23 @@ func eventPipeReadLoop(fd int) {
 			continue
 		}
 		dispatchEvent(buf[:n])
+	}
+}
+
+// eventPipeDropMonitor periodically reports the cumulative event-drop count
+// (writer socket full → consumer behind) so sustained backpressure is visible
+// in logcat rather than silent (F24).  Runs for the process lifetime.
+func eventPipeDropMonitor() {
+	var last uint64
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		d := uint64(C.event_pipe_drops())
+		if d != last {
+			logNativeWarn(fmt.Sprintf("event_pipe: %d events dropped total (+%d in last 30s; consumer behind)",
+				d, d-last))
+			last = d
+		}
 	}
 }
 
@@ -205,9 +238,11 @@ func dispatchEvent(data []byte) {
 // The C helper takes ownership of gref and calls DeleteGlobalRef internally.
 func dispatchObjReturn(callID uint64, offset int, gref uintptr, name string) {
 	if consumerEnv == nil {
-		// Consumer didn't attach.  Leak the gref by design — we can't free it
-		// from a non-attached thread, and trying to DeleteGlobalRef from here
-		// without env crashes.  Emit a placeholder so the pairing still fires.
+		// Unreachable in normal operation since F1: the C side only emits an
+		// EV_OBJ_RETURN (and mints its gref) when event_pipe_consumer_ready()
+		// is set, which this goroutine sets only AFTER consumerEnv is non-nil.
+		// Kept as a defensive guard — emit the pairing with a null return rather
+		// than dereferencing a nil env.
 		v, ok := pendingCalls.LoadAndDelete(callID)
 		if !ok {
 			return

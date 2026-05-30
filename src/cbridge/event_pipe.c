@@ -32,6 +32,16 @@
 
 #include <jni.h>
 
+/* Minimal direct logcat for the one-shot init readback (F24).  event_pipe.c is
+ * the first file in the concatenated TU, so we keep a local guarded macro
+ * rather than depending on bridge.h ordering. */
+#if __has_include(<android/log.h>)
+#include <android/log.h>
+#define EVP_LOG(...) __android_log_print(ANDROID_LOG_INFO, "JNILogPayload", __VA_ARGS__)
+#else
+#define EVP_LOG(...) ((void)0)
+#endif
+
 /* Per-string max bytes when packing into the datagram.  Strings longer
  * than this are truncated.  Generous enough that the Go-side rendering
  * never sees a string the user-visible logger would otherwise have. */
@@ -50,26 +60,69 @@ static int g_writer_fd  = -1;
 static int g_reader_fd  = -1;
 static pthread_mutex_t g_send_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Per-thread sidecar for deferred-render refs. */
+/* Set to 1 by the Go reader after a successful AttachCurrentThreadAsDaemon,
+ * back to 0 if the reader loop exits.  Gates deferred-gref creation (F1) so a
+ * gref is never minted for a consumer that will never render or free it.
+ * Plain int + __atomic_* to match the project's existing atomic discipline. */
+static int g_consumer_ready = 0;
+
+/* Monotonic count of datagrams dropped on a full writer socket (F24). */
+static uint64_t g_drop_count = 0;
+
+int event_pipe_consumer_ready(void) {
+    return __atomic_load_n(&g_consumer_ready, __ATOMIC_ACQUIRE);
+}
+void event_pipe_set_consumer_ready(int ready) {
+    __atomic_store_n(&g_consumer_ready, ready ? 1 : 0, __ATOMIC_RELEASE);
+}
+uint64_t event_pipe_drops(void) {
+    return __atomic_load_n(&g_drop_count, __ATOMIC_RELAXED);
+}
+
+/* Per-thread sidecar for deferred-render refs.  `env` is the hook thread's
+ * JNIEnv* captured at push time, so the emit path can DeleteGlobalRef the refs
+ * itself when the carrying datagram is dropped (F1) — the hook thread always
+ * has a valid env, and every ref in one event is pushed from that same thread. */
 struct tls_render_refs {
     uint8_t   nrefs;
     uintptr_t refs[EVENT_PIPE_MAX_REFS];
+    JNIEnv   *env;
 };
 static __thread struct tls_render_refs g_tls_refs = {0};
 
 int event_pipe_defer_render_push(void *env, void *obj) {
     if (!env || !obj) return -1;
+    /* Never mint a gref unless a consumer is attached to render + free it. */
+    if (!event_pipe_consumer_ready()) return -1;
     if (g_tls_refs.nrefs >= EVENT_PIPE_MAX_REFS) return -1;
     JNIEnv *je = (JNIEnv*)env;
     void *gref = (void*)(*je)->NewGlobalRef(je, obj);
     if (!gref) return -1;
     int slot = g_tls_refs.nrefs++;
     g_tls_refs.refs[slot] = (uintptr_t)gref;
+    g_tls_refs.env = je;
     return slot;
 }
 
-void event_pipe_render_refs_reset(void) {
+/* Success path: the consumer now owns the refs and will DeleteGlobalRef them
+ * after rendering.  Just forget them locally. */
+static void event_pipe_render_refs_reset(void) {
     g_tls_refs.nrefs = 0;
+    g_tls_refs.env   = NULL;
+}
+
+/* Failure path: the datagram carrying these refs was never delivered, so the
+ * hook thread still owns them — free them here (we stashed a valid env at push
+ * time) so a dropped/overflowed event never leaks a global ref (F1). */
+static void event_pipe_render_refs_drop(void) {
+    JNIEnv *je = g_tls_refs.env;
+    if (je) {
+        for (uint8_t i = 0; i < g_tls_refs.nrefs; i++) {
+            (*je)->DeleteGlobalRef(je, (jobject)g_tls_refs.refs[i]);
+        }
+    }
+    g_tls_refs.nrefs = 0;
+    g_tls_refs.env   = NULL;
 }
 
 /* ── little-endian writers (no host-byte-order assumptions) ─────────── */
@@ -101,14 +154,14 @@ static int append_str(uint8_t *buf, size_t *pos, size_t cap, const char *s) {
     return append_str_max(buf, pos, cap, s, EV_STR_MAX_BYTES);
 }
 
-/* Append the TLS sidecar refs (if any) to the datagram and clear it.
- * Sidecar wire layout: 1 byte nrefs, then nrefs × 8 bytes gref.  Returns
- * the new pos, or 0 on overflow (caller treats as send failure).  Always
- * resets the TLS sidecar regardless of success/failure to avoid leaks. */
+/* Append the TLS sidecar refs (if any) to the datagram.  Sidecar wire layout:
+ * 1 byte nrefs, then nrefs × 8 bytes gref.  Returns the new pos, or 0 on
+ * overflow.  Does NOT clear the TLS sidecar — ownership of the grefs is
+ * resolved by finish_record() based on whether send() actually delivered the
+ * datagram (consumer keeps them) or not (we free them) (F1). */
 static size_t append_render_refs(uint8_t *buf, size_t pos, size_t cap) {
     uint8_t n = g_tls_refs.nrefs;
     if (pos + 1 + (size_t)n * 8 > cap) {
-        event_pipe_render_refs_reset();
         return 0;
     }
     buf[pos++] = n;
@@ -116,7 +169,6 @@ static size_t append_render_refs(uint8_t *buf, size_t pos, size_t cap) {
         put_u64(buf, pos, (uint64_t)g_tls_refs.refs[i]);
         pos += 8;
     }
-    event_pipe_render_refs_reset();
     return pos;
 }
 
@@ -157,6 +209,16 @@ int event_pipe_init(void) {
     (void)setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     g_writer_fd = sv[0];
     g_reader_fd = sv[1];
+    /* Read back the kernel-granted buffer sizes (the kernel clamps to
+     * wmem_max/rmem_max and typically doubles the request for bookkeeping) so
+     * the real capacity is observable rather than guessed (F24). */
+    int got_snd = 0, got_rcv = 0;
+    socklen_t sl = sizeof(got_snd);
+    (void)getsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &got_snd, &sl);
+    sl = sizeof(got_rcv);
+    (void)getsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &got_rcv, &sl);
+    EVP_LOG("event_pipe: SNDBUF requested=%d granted=%d; RCVBUF requested=%d granted=%d",
+            sndbuf, got_snd, rcvbuf, got_rcv);
     return 0;
 }
 
@@ -174,7 +236,28 @@ static int send_record(const uint8_t *buf, size_t len) {
     pthread_mutex_unlock(&g_send_lock);
     if (n == (ssize_t)len) return 0;
     /* EAGAIN/EWOULDBLOCK — Go reader behind; drop the event. */
+    __atomic_add_fetch(&g_drop_count, 1, __ATOMIC_RELAXED);
     return -1;
+}
+
+/* Finalize an emit: append the TLS sidecar, send the datagram, and resolve
+ * gref ownership.  On success the consumer owns the sidecar grefs (it renders
+ * then DeleteGlobalRefs them); on any failure (sidecar overflow or a dropped
+ * datagram) we DeleteGlobalRef them here so nothing leaks (F1).  All emit bufs
+ * are sized EVENT_MAX_BYTES.  Returns 0 on success, -1 if the event was
+ * dropped. */
+static int finish_record(uint8_t *buf, size_t pos) {
+    pos = append_render_refs(buf, pos, EVENT_MAX_BYTES);
+    if (pos == 0) {
+        event_pipe_render_refs_drop();
+        return -1;
+    }
+    if (send_record(buf, pos) != 0) {
+        event_pipe_render_refs_drop();
+        return -1;
+    }
+    event_pipe_render_refs_reset();
+    return 0;
 }
 
 /* ── emit functions ─────────────────────────────────────────────────── */
@@ -198,12 +281,10 @@ int event_pipe_emit_call(
         append_str(buf, &pos, sizeof(buf), method_name)     ||
         append_str(buf, &pos, sizeof(buf), encoded_args)    ||
         append_str(buf, &pos, sizeof(buf), caller)) {
-        event_pipe_render_refs_reset();
+        event_pipe_render_refs_drop();
         return -1;
     }
-    pos = append_render_refs(buf, pos, sizeof(buf));
-    if (pos == 0) return -1;
-    return send_record(buf, pos);
+    return finish_record(buf, pos);
 }
 
 int event_pipe_emit_return(
@@ -219,12 +300,10 @@ int event_pipe_emit_return(
     if (append_str(buf, &pos, sizeof(buf), name)     ||
         append_str(buf, &pos, sizeof(buf), ret_str)  ||
         append_str(buf, &pos, sizeof(buf), ret_extra)) {
-        event_pipe_render_refs_reset();
+        event_pipe_render_refs_drop();
         return -1;
     }
-    pos = append_render_refs(buf, pos, sizeof(buf));
-    if (pos == 0) return -1;
-    return send_record(buf, pos);
+    return finish_record(buf, pos);
 }
 
 int event_pipe_emit_lookup(
@@ -242,12 +321,10 @@ int event_pipe_emit_lookup(
         append_str(buf, &pos, sizeof(buf), sig)         ||
         append_str(buf, &pos, sizeof(buf), class_name)  ||
         append_str(buf, &pos, sizeof(buf), caller)) {
-        event_pipe_render_refs_reset();
+        event_pipe_render_refs_drop();
         return -1;
     }
-    pos = append_render_refs(buf, pos, sizeof(buf));
-    if (pos == 0) return -1;
-    return send_record(buf, pos);
+    return finish_record(buf, pos);
 }
 
 int event_pipe_emit_field_access(
@@ -273,12 +350,10 @@ int event_pipe_emit_field_access(
         append_str(buf, &pos, sizeof(buf), value_str)       ||
         append_str(buf, &pos, sizeof(buf), value_extra)     ||
         append_str(buf, &pos, sizeof(buf), caller)) {
-        event_pipe_render_refs_reset();
+        event_pipe_render_refs_drop();
         return -1;
     }
-    pos = append_render_refs(buf, pos, sizeof(buf));
-    if (pos == 0) return -1;
-    return send_record(buf, pos);
+    return finish_record(buf, pos);
 }
 
 int event_pipe_emit_register_natives(
@@ -296,12 +371,10 @@ int event_pipe_emit_register_natives(
     if (append_str(buf, &pos, sizeof(buf), class_name)             ||
         append_str_max(buf, &pos, sizeof(buf), methods, 2048)      ||
         append_str(buf, &pos, sizeof(buf), caller)) {
-        event_pipe_render_refs_reset();
+        event_pipe_render_refs_drop();
         return -1;
     }
-    pos = append_render_refs(buf, pos, sizeof(buf));
-    if (pos == 0) return -1;
-    return send_record(buf, pos);
+    return finish_record(buf, pos);
 }
 
 int event_pipe_emit_obj_return(
@@ -314,12 +387,10 @@ int event_pipe_emit_obj_return(
                              /* nstrings = */ 1,
                              offset, call_id, (uint64_t)gref);
     if (append_str(buf, &pos, sizeof(buf), name)) {
-        event_pipe_render_refs_reset();
+        event_pipe_render_refs_drop();
         return -1;
     }
-    pos = append_render_refs(buf, pos, sizeof(buf));
-    if (pos == 0) return -1;
-    return send_record(buf, pos);
+    return finish_record(buf, pos);
 }
 
 /* WIRE_KIND_* values are defined in bridge.h via hook_internal.h. */

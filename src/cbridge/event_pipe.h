@@ -91,18 +91,35 @@ int  event_pipe_render_obj(
  * formatted chunk produced by vis_*ing the corresponding ref on the consumer's
  * JNIEnv*.
  *
- * Sidecar lifecycle:
- *   1. hot path: defer_render_push(env, obj) for each object to render
- *      → NewGlobalRef + record in TLS, returns slot index 0..7 (or -1 on full)
- *   2. encoder writes "\x1A<slot>" placeholder where the rendered chunk
- *      would have appeared
- *   3. event_pipe_emit_* picks up the TLS refs, appends them to the
- *      datagram, then clears the TLS state
+ * Global-ref ownership (F1): a deferred gref is minted ONLY when a consumer is
+ * attached and draining (event_pipe_consumer_ready()).  Ownership transfers to
+ * the consumer iff the carrying datagram is actually delivered:
+ *   1. hot path: defer_render_push(env, obj) → if a consumer is ready,
+ *      NewGlobalRef + record in TLS (with the hook thread's env), returns slot
+ *      index 0..EVENT_PIPE_MAX_REFS-1; returns -1 when full OR no consumer is
+ *      ready (callers then fall back to inline render / a null placeholder).
+ *   2. encoder writes the "\x1A<slot>" placeholder.
+ *   3. event_pipe_emit_* appends the TLS refs to the datagram and send()s it,
+ *      then EITHER forgets them on success (the consumer now owns the grefs and
+ *      DeleteGlobalRefs them after rendering) OR DeleteGlobalRefs them itself on
+ *      any failure (overflow / dropped datagram) — so a dropped event never
+ *      leaks a gref.
  */
 #define EVENT_PIPE_MAX_REFS 8
 
 int  event_pipe_defer_render_push(void *env, void *obj);
-void event_pipe_render_refs_reset(void);
+
+/* Consumer-readiness gate (F1).  The Go reader sets this to 1 only AFTER a
+ * successful AttachCurrentThreadAsDaemon (so it can render + free grefs), and
+ * back to 0 if the reader loop exits.  defer_render_push and the standalone-gref
+ * emit paths (obj-return, deferred lookup) consult it before NewGlobalRef so a
+ * gref is never minted for a consumer that will never drain it. */
+int  event_pipe_consumer_ready(void);
+void event_pipe_set_consumer_ready(int ready);
+
+/* Monotonic count of events dropped because the writer socket was full
+ * (consumer behind).  Read by the Go reader for periodic observability (F24). */
+uint64_t event_pipe_drops(void);
 
 /* Hot-path emits.  Each builds a single packed datagram and sends it on
  * the writer fd.  Returns 0 on success, -1 if event_pipe is disabled or

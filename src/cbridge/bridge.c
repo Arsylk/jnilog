@@ -230,9 +230,22 @@ void log_jni_lookup_deferred(
     if (!logging_ready_fast()) return;
     if (!config_is_allowed(lookup_type)) return;
     JNIEnv *je = (JNIEnv*)env;
-    void *gref = (clazz && je) ? (void*)(*je)->NewGlobalRef(je, clazz) : NULL;
-    /* Empty class_name + non-zero clazz tells the consumer to render. */
-    event_pipe_emit_lookup((uintptr_t)gref, lookup_type, name, sig, "", caller);
+    /* Defer (and thus NewGlobalRef) only when a consumer is attached to render +
+     * free the gref, and only commit ownership if the datagram is delivered;
+     * otherwise free it ourselves so a dropped lookup never leaks a gref (F1). */
+    if (je && clazz && event_pipe_consumer_ready()) {
+        void *gref = (void*)(*je)->NewGlobalRef(je, clazz);
+        if (gref) {
+            /* Empty class_name + non-zero clazz tells the consumer to render. */
+            if (event_pipe_emit_lookup((uintptr_t)gref, lookup_type, name, sig, "", caller) != 0) {
+                (*je)->DeleteGlobalRef(je, gref);   /* dropped — we still own it */
+            }
+            return;
+        }
+    }
+    /* No consumer / no gref: emit with the raw clazz pointer as an opaque
+     * display id and no resolvable class name. */
+    event_pipe_emit_lookup((uintptr_t)clazz, lookup_type, name, sig, "", caller);
 }
 
 /*

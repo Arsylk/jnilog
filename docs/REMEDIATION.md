@@ -125,7 +125,18 @@ hook thread always has a valid `JNIEnv*`, so thread it into the emit/reset path.
 - Device: run §0.4 stress capture for ≥10 min; `dumpsys meminfo` gref count stable; no
   global-ref-table-overflow in logcat. Compare against baseline (which should leak).
 
-- ☐ F1 implemented · ☐ host-tested · ☐ device-tested
+- ☑ F1 implemented · ☑ host-tested · ☑ device-tested
+  **Implementation:** consumer-ready gate (`event_pipe_consumer_ready`/`event_pipe_set_consumer_ready`)
+  so a gref is minted only when the reader is attached + draining; TLS sidecar stashes the hook
+  thread's `env`; `append_render_refs` no longer resets; `finish_record()` makes ownership transfer
+  atomic with send — `render_refs_reset()` on success (consumer frees), `render_refs_drop()`
+  (DeleteGlobalRef each) on overflow/EAGAIN. Same gate+free-on-drop applied to the two standalone-gref
+  paths: obj-return (`hooks.c` `_log_obj_ret`) and deferred lookup (`bridge.c` `log_jni_lookup_deferred`).
+  Go reader sets ready after attach, clears on exit.
+  **Device (2026-05-31, eightballpool, everything-on stress):** ~19k events/s; drop monitor logged
+  `14289 events dropped total` (drop path heavily exercised); `globals=` gref count flat 15616→15856
+  over 75s (limit ~51200), no overflow, injected app never crashed, **no libjnilog frame in any
+  tombstone**. chatgpt happy-path op-frequency identical to baseline.
 
 ---
 
@@ -139,7 +150,13 @@ hook thread always has a valid `JNIEnv*`, so thread it into the emit/reset path.
 - Reader loop (`event_pipe.go:85`) has no shutdown; acceptable for process-lifetime, but add a
   comment stating it intentionally runs until read error / process exit.
 
-**Acceptance:** logcat shows granted buffer sizes and periodic drop counts. ☐ done
+**Acceptance:** logcat shows granted buffer sizes and periodic drop counts. ☑ done
+**Implementation:** `g_drop_count` (`__atomic`) incremented in `send_record` on EAGAIN, exposed via
+`event_pipe_drops()`; Go `eventPipeDropMonitor` goroutine logs cumulative+delta every 30s when changed
+and the reader logs the final count on exit. `event_pipe_init` now `getsockopt`s the granted
+SO_SNDBUF/SO_RCVBUF and logs them once. Reader-loop shutdown semantics documented inline.
+**Device:** logcat showed `event_pipe: SNDBUF requested=1048576 granted=2097152; RCVBUF requested=1048576 granted=2097152`
+and `event_pipe: 14289 events dropped total (+14289 in last 30s; consumer behind)`.
 
 ---
 
