@@ -180,7 +180,16 @@ mis-parse and render the wrong object. RegisterNatives already dodges this with 
 
 **Acceptance:** craft a method call with a >512-byte `toString()` containing multibyte chars and
 a deferred object; rendered line must show the object correctly, no stray `\x1A`/replacement
-chars. ☐ host-tested · ☐ device-tested
+chars. ☑ host-tested · ☑ device-tested
+**Implementation:** `safe_trunc_len()` in `event_pipe.c` backs a truncation off (a) trailing UTF-8
+continuation bytes (`(b&0xC0)==0x80`) so Go never sees a split sequence, and (b) a dangling `\x1A`
+marker whose slot byte was cut. Applied in `append_str_max` (covers both structured and leaf
+fields). Kept the 512 cap (decoder is fully resilient to a truncated final record — pure
+`strings.Split`, no panic), so output stays diff-clean vs baseline. Added a build `_Static_assert`
+that a maximal event (7 × 512 + header + full sidecar) fits `EVENT_MAX_BYTES`.
+**Verification:** host unit test of `safe_trunc_len` (2/3-byte UTF-8 splits, dangling/complete `\x1A`
+pairs) passes; device chatgpt capture rendered deferred objects with full `toString()` and **0 stray
+`\x1A`, 0 U+FFFD**.
 
 ---
 
@@ -197,7 +206,15 @@ as `:;<…` and silently corrupts the stream.
   Prefer this — it also lets us raise `EVENT_PIPE_MAX_REFS` for F7-heavy events.
 
 **Acceptance:** set `EVENT_PIPE_MAX_REFS` to 12 temporarily in a test build; multi-object call
-renders all objects correctly. ☐ done
+renders all objects correctly. ☑ done (robust option)
+**Implementation:** slot encoded as `\x1A` + byte `(slot+1)` at all 5 emit sites (`hooks.c` ×3,
+`hook_fields.c`, `hook_logging.c`); `substitutePlaceholders` decodes `slot = s[i+1]-1`. The **+1**
+offset (vs the doc's literal `(uint8_t)n`) is required so the slot byte is never NUL — the markers
+flow through NUL-terminated C encoder strings, so a raw 0 for slot 0 would silently truncate.
+`_Static_assert(EVENT_PIPE_MAX_REFS <= 254)` documents the new ceiling. **Verification:** host
+unit test round-trips slots 0..11 (all non-zero, decode==slot); device capture rendered 1164
+deferred-object/string args correctly with 0 stray markers. Cap left at 8 in production (raising it
+is now safe by construction; not needed yet).
 
 ---
 

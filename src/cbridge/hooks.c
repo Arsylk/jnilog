@@ -91,7 +91,10 @@ static inline void _log_obj_arg_call(int slot, const char *name,
         if (n < 0) {
             snprintf(enc, sizeof(enc), "p\x01" "null\x02");
         } else {
-            snprintf(enc, sizeof(enc), "\x1A%c", '0' + n);
+            /* Deferred-render placeholder: marker "\x1A" + slot byte (slot+1).
+             * The +1 keeps the byte non-zero so it survives this NUL-terminated
+             * encoder string; the Go substituter decodes slot = byte-1 (F8). */
+            snprintf(enc, sizeof(enc), "\x1A%c", n + 1);
         }
     }
     log_jni_call(slot, name, WIRE_KIND_NULL, "", "", "", name, enc, 0, caller_str);
@@ -125,7 +128,7 @@ static inline void _log_obj2_arg_call(int slot, const char *name,
             } else {
                 if (pos + 2 < (int)sizeof(enc)) {
                     enc[pos++] = '\x1A';
-                    enc[pos++] = (char)('0' + slotn);
+                    enc[pos++] = (char)(slotn + 1);   /* slot+1, NUL-safe (F8) */
                     enc[pos] = '\0';
                 }
             }
@@ -559,7 +562,7 @@ static void hooked_SetObjectArrayElement(JNIEnv *env, jobjectArray array,
       if (slotn < 0) {
         ENC_APPEND("p\x01" "null\x02");
       } else {
-        ENC_APPEND("\x1A%c", '0' + slotn);
+        ENC_APPEND("\x1A%c", slotn + 1);   /* slot+1, NUL-safe (F8) */
       }
     }
 #undef ENC_APPEND

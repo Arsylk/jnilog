@@ -391,8 +391,11 @@ func indexByte(s string, b byte) int {
 	return -1
 }
 
-// substitutePlaceholders replaces every "\x1A<digit>" marker with the
-// corresponding rendered chunk.
+// substitutePlaceholders replaces every "\x1A<slot>" marker with the
+// corresponding rendered chunk.  The slot is encoded by the C emit sites as a
+// single byte holding slot+1 (the +1 keeps it non-zero so it survives the
+// NUL-terminated C encoder string), so a raw byte — not an ASCII digit — and
+// EVENT_PIPE_MAX_REFS is no longer capped at 10 (F8).
 func substitutePlaceholders(s string, rendered []string) string {
 	if len(rendered) == 0 || len(s) < 2 {
 		return s
@@ -400,10 +403,10 @@ func substitutePlaceholders(s string, rendered []string) string {
 	out := make([]byte, 0, len(s)+64)
 	for i := 0; i < len(s); i++ {
 		if s[i] == '\x1A' && i+1 < len(s) {
-			d := s[i+1]
-			if d >= '0' && d < '0'+byte(len(rendered)) {
-				out = append(out, rendered[d-'0']...)
-				i++ // skip the digit
+			slot := int(s[i+1]) - 1
+			if slot >= 0 && slot < len(rendered) {
+				out = append(out, rendered[slot]...)
+				i++ // skip the slot byte
 				continue
 			}
 		}

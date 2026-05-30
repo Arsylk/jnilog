@@ -59,7 +59,7 @@ static void fill_object_strings(JNIEnv *env, void *obj,
     int slotn = event_pipe_defer_render_push(env, obj);
     if (slotn >= 0) {
         char *ph = (char*)malloc(3);
-        if (ph) { ph[0] = '\x1A'; ph[1] = (char)('0' + slotn); ph[2] = '\0'; }
+        if (ph) { ph[0] = '\x1A'; ph[1] = (char)(slotn + 1); ph[2] = '\0'; }  /* slot+1, NUL-safe (F8) */
         *out_str = ph;
         return;
     }

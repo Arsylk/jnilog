@@ -56,6 +56,25 @@
 
 #define HDR_FIXED_BYTES    32
 
+/* Build-time guarantee that a maximal event still fits one datagram, so emits
+ * never silently overflow (F7).  7 = most strings in any event (EV_CALL /
+ * EV_FIELD_ACCESS); 2 = the u16 length prefix per string; the sidecar is
+ * 1 byte nrefs + EVENT_PIPE_MAX_REFS × 8.  This 7×512 bound also dominates the
+ * EV_REGISTER_NATIVES shape (512 + 2048 + 512). */
+_Static_assert(HDR_FIXED_BYTES
+               + 7 * (2 + EV_STR_MAX_BYTES)
+               + (1 + EVENT_PIPE_MAX_REFS * 8)
+               <= EVENT_MAX_BYTES,
+               "maximal event must fit EVENT_MAX_BYTES");
+
+/* Deferred-render slot is encoded on the wire as the two bytes "\x1A" then
+ * (uint8_t)(slot+1) — the +1 keeps the slot byte non-zero so it survives the
+ * NUL-terminated C string pipeline (a raw 0 would terminate the encoder
+ * string).  That leaves room for slots 0..253 (F8), well past any plausible
+ * EVENT_PIPE_MAX_REFS. */
+_Static_assert(EVENT_PIPE_MAX_REFS <= 254,
+               "deferred-render slot must fit a single non-zero byte (slot+1)");
+
 static int g_writer_fd  = -1;
 static int g_reader_fd  = -1;
 static pthread_mutex_t g_send_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -134,14 +153,34 @@ static inline void put_u64(uint8_t  *p, size_t off, uint64_t v)  {
 }
 static inline void put_i32(uint8_t  *p, size_t off, int32_t  v)  { put_u32(p, off, (uint32_t)v); }
 
-/* Append a length-prefixed string to buf at *pos, truncating at max_bytes.
- * s may be NULL → treated as empty string.  Returns 0 on success or -1 if the
- * buffer would overflow. */
+/* Given that we intend to keep the first `len` bytes of NUL-terminated `s`
+ * (len <= strlen(s)), back the cut off to a safe boundary so a truncated field
+ * never desyncs the wire (F7).  Two hazards, both of which the blind clip used
+ * to hit:
+ *   1. UTF-8: if the first dropped byte is a continuation byte (10xxxxxx) the
+ *      multibyte char straddles the cut — retreat to its char boundary so Go
+ *      never sees invalid UTF-8 / a replacement char.
+ *   2. A trailing lone "\x1A" deferred-render marker whose slot byte was cut
+ *      off — drop it so the Go substituter never mistakes the next byte for a
+ *      slot and the sidecar count never disagrees with the placeholders. */
+static size_t safe_trunc_len(const char *s, size_t len) {
+    while (len > 0 && ((unsigned char)s[len] & 0xC0) == 0x80) {
+        len--;
+    }
+    if (len > 0 && (unsigned char)s[len - 1] == 0x1A) {
+        len--;
+    }
+    return len;
+}
+
+/* Append a length-prefixed string to buf at *pos, truncating at max_bytes on a
+ * safe boundary (see safe_trunc_len).  s may be NULL → treated as empty string.
+ * Returns 0 on success or -1 if the buffer would overflow. */
 static int append_str_max(uint8_t *buf, size_t *pos, size_t cap,
                           const char *s, size_t max_bytes) {
     if (!s) s = "";
     size_t len = strlen(s);
-    if (len > max_bytes) len = max_bytes;
+    if (len > max_bytes) len = safe_trunc_len(s, max_bytes);
     if (*pos + 2 + len > cap) return -1;
     put_u16(buf, *pos, (uint16_t)len);
     if (len) memcpy(buf + *pos + 2, s, len);
