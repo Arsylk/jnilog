@@ -244,12 +244,20 @@ int should_log_from_caller(JNIEnv *env, void *caller) {
 /* ── Config query cache ───────────────────────────────────────────────────
  * Each JNI function name crosses cgo exactly once.  Subsequent hits do an
  * O(1) pointer comparison in a linear-probe hash table.
+ *
+ * Callers are expected to pass stable interned string literals (the JNI
+ * function names baked into rodata).  `key` keeps the caller pointer purely
+ * for that identity fast path and is never dereferenced; `owned` is a private
+ * strdup'd copy and is the only pointer we ever strcmp.  This way a caller that
+ * mistakenly passes a transient (stack/heap) pointer can at worst produce a
+ * stale result — never a dangling-pointer dereference.
  * ──────────────────────────────────────────────────────────────────────── */
 #define CONFIG_CACHE_SIZE 256
 #define CONFIG_CACHE_MASK (CONFIG_CACHE_SIZE - 1)
 
 typedef struct {
-  const char *name;
+  const char *key;      /* caller's interned pointer — identity fast path, never dereferenced */
+  char       *owned;    /* strdup'd copy of the name — the only pointer we dereference */
   int         result;   /* -1 = unchecked, 0 = blocked, 1 = allowed */
 } config_cache_entry_t;
 
@@ -280,14 +288,16 @@ static int cfg_lookup(const char *name, int *out) {
       if (config_function_blacklisted((char *)name)) allowed = 0;
       else if (!config_function_enabled((char *)name)) allowed = 0;
       pthread_mutex_lock(&g_cfg_cache_lock);
-      /* Re-check the slot — another thread may have populated it. */
-      if (e->result == -1) { e->name = name; e->result = allowed; }
+      /* Re-check the slot — another thread may have populated it.  Write owned
+       * (and key) before result so a concurrent reader that sees result != -1
+       * also sees a fully populated entry (all under the lock). */
+      if (e->result == -1) { e->owned = strdup(name); e->key = name; e->result = allowed; }
       *out = e->result;
       pthread_mutex_unlock(&g_cfg_cache_lock);
       return 1;
     }
-    if (e->name == name) { *out = e->result; pthread_mutex_unlock(&g_cfg_cache_lock); return 1; }
-    if (e->name && strcmp(e->name, name) == 0) { e->name = name; *out = e->result; pthread_mutex_unlock(&g_cfg_cache_lock); return 1; }
+    if (e->key == name) { *out = e->result; pthread_mutex_unlock(&g_cfg_cache_lock); return 1; }
+    if (e->owned && strcmp(e->owned, name) == 0) { e->key = name; *out = e->result; pthread_mutex_unlock(&g_cfg_cache_lock); return 1; }
   }
   pthread_mutex_unlock(&g_cfg_cache_lock);
   /* Cache full — fall back to direct Go-side query. */

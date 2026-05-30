@@ -200,8 +200,14 @@ void log_method_return_value(JNIEnv *env, const method_log_ctx_t *ctx,
      * Degrade to WIRE_KIND_NULL: the formatter renders this as a bare
      * return-from-throwing-call rather than a misleading value. */
     if (!has_no_exception(env)) {
-        const char *dname = ctx->method_name ? ctx->method_name : name;
-        log_jni_return(slot, dname, (int)WIRE_KIND_NULL, 0, "", "");
+        /* Key on the stable JNI-function literal `name`, never on
+         * ctx->method_name (which points into the stack-allocated ctx's
+         * method_name_buf): log_jni_return → config_is_allowed caches the
+         * pointer in a long-lived table, so a stack pointer would dangle and
+         * later crash. It must also match the call's gate — config is keyed on
+         * JNI function names, not Java method names — or the return is dropped
+         * and the Go-side callFrame leaks. */
+        log_jni_return(slot, name, (int)WIRE_KIND_NULL, 0, "", "");
         return;
     }
 
@@ -246,8 +252,11 @@ void log_method_return_value(JNIEnv *env, const method_log_ctx_t *ctx,
         break;
     }
 
-    const char *display_name = ctx->method_name ? ctx->method_name : name;
-    log_jni_return(slot, display_name, (int)wkind, raw,
+    /* Key on the stable JNI-function literal `name`, not ctx->method_name —
+     * see the rationale in the exception branch above. The Java method name is
+     * already carried on the paired call event (correlated by call_id on the
+     * Go side), so the return event does not need it. */
+    log_jni_return(slot, name, (int)wkind, raw,
                    str   ? str   : "",
                    extra ? extra : "");
     free(str);
