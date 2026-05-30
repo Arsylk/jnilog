@@ -1,0 +1,3 @@
+673818b4d4bd6437292620ccf173d656cace9f1af67991d093a4d65b74341849  dist/libjnilog.so
+size=4623464
+dist/libjnilog.so: ELF 64-bit LSB shared object, ARM aarch64, version 1 (SYSV), dynamically linked, for Android 21, built by NDK r29 (14206865), Go BuildID=M0KFNSaEJLvQt7P8ET_9/h0glj7DmT2rgnprxPcU5/-6g5RcVnT_17yMUP2TJ0/4mJCPQe3-VDpcq0EsRqk, BuildID[sha1]=92c6baa14309b8142fe095ae9dc5105103c8d2db, with debug_info, not stripped

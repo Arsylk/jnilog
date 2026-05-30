@@ -86,9 +86,12 @@ before_build(function(target)
 	print(string.format("Building unified libjnilog.so (aarch64-linux-android%s, host=%s)...", api, ndk_host))
 	local go_src = path.join(os.projectdir(), "src", "go")
 	local oldir = os.cd(go_src)
+	-- NOTE: no `-a`. The phony target re-runs before_build on every invocation,
+	-- and Go's build cache tracks cgo inputs (including the generated
+	-- _cgo_export.h) correctly, so a force-rebuild only wastes time. Use
+	-- `xmake b -r jnilog` if a clean rebuild is ever needed.
 	os.vrunv("go", {
 		"build",
-		"-a",
 		"-buildmode=c-shared",
 		"-o",
 		so_out,

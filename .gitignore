@@ -32,6 +32,9 @@ log_*.txt
 # Runtime sink dump used by manual runs
 mlog.txt
 
+# asciinema capture recordings (large, run-specific — kept locally, never tracked)
+*.ascii
+
 # Amazon Kiro IDE specs / steering — local-only by default.
 # Remove this line if you want to track .kiro/ deliberately.
 .kiro/

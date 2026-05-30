@@ -1,0 +1,146 @@
+=== go vet ./... ===
+=== go test ./... -count=1 -v ===
+=== RUN   TestCallFrameStackConcurrent
+--- PASS: TestCallFrameStackConcurrent (0.00s)
+=== RUN   TestCallFrameStackSingleTid
+--- PASS: TestCallFrameStackSingleTid (0.00s)
+=== RUN   TestPlaceholder
+    pbt_test.go:16: [rapid] OK, passed 100 tests (76.8µs)
+--- PASS: TestPlaceholder (0.00s)
+=== RUN   TestWireProtocolRoundTrip
+    pbt_test.go:187: [rapid] OK, passed 100 tests (951.114µs)
+--- PASS: TestWireProtocolRoundTrip (0.00s)
+=== RUN   TestWireProtocolResilience
+    pbt_test.go:368: [rapid] OK, passed 100 tests (149.459µs)
+--- PASS: TestWireProtocolResilience (0.00s)
+=== RUN   TestTypeDirectedValueFormatting
+    pbt_test.go:454: [rapid] OK, passed 100 tests (174.719µs)
+--- PASS: TestTypeDirectedValueFormatting (0.00s)
+=== RUN   TestNoColorDisablesANSI
+    pbt_test.go:530: [rapid] OK, passed 100 tests (179.989µs)
+--- PASS: TestNoColorDisablesANSI (0.00s)
+=== RUN   TestCallFrameStackLIFO
+    pbt_test.go:552: [rapid] OK, passed 100 tests (9.992563ms)
+--- PASS: TestCallFrameStackLIFO (0.01s)
+=== RUN   TestJNISignatureParsing
+    pbt_test.go:736: [rapid] OK, passed 100 tests (1.231403ms)
+--- PASS: TestJNISignatureParsing (0.00s)
+=== RUN   TestArrayRenderingLimit
+    pbt_test.go:826: [rapid] OK, passed 100 tests (713.166µs)
+--- PASS: TestArrayRenderingLimit (0.00s)
+=== RUN   TestFormatUriFileComponentName
+--- PASS: TestFormatUriFileComponentName (0.00s)
+=== RUN   TestJNISignatureParsingStandaloneField
+    pbt_test.go:971: [rapid] OK, passed 100 tests (289.728µs)
+--- PASS: TestJNISignatureParsingStandaloneField (0.00s)
+=== RUN   TestFormatIntent
+=== RUN   TestFormatIntent/full_intent_with_act/dat/cmp/extras
+=== RUN   TestFormatIntent/intent_with_only_act_field
+=== RUN   TestFormatIntent/empty_intent_(no_fields)
+--- PASS: TestFormatIntent (0.00s)
+    --- PASS: TestFormatIntent/full_intent_with_act/dat/cmp/extras (0.00s)
+    --- PASS: TestFormatIntent/intent_with_only_act_field (0.00s)
+    --- PASS: TestFormatIntent/empty_intent_(no_fields) (0.00s)
+=== RUN   TestFormatBundle
+=== RUN   TestFormatBundle/empty_bundle_renders_empty
+=== RUN   TestFormatBundle/non-empty_bundle_renders_ellipsis
+=== RUN   TestFormatBundle/empty_bundle_no_color
+=== RUN   TestFormatBundle/non-empty_bundle_no_color
+=== RUN   TestFormatBundle/bundle_with_neither_empty_nor_Bundle[_prefix
+--- PASS: TestFormatBundle (0.00s)
+    --- PASS: TestFormatBundle/empty_bundle_renders_empty (0.00s)
+    --- PASS: TestFormatBundle/non-empty_bundle_renders_ellipsis (0.00s)
+    --- PASS: TestFormatBundle/empty_bundle_no_color (0.00s)
+    --- PASS: TestFormatBundle/non-empty_bundle_no_color (0.00s)
+    --- PASS: TestFormatBundle/bundle_with_neither_empty_nor_Bundle[_prefix (0.00s)
+=== RUN   TestSinkPanicRecovery
+[jnilog] WARNING: sink panicked: intentional panic from panickingSink
+--- PASS: TestSinkPanicRecovery (0.00s)
+=== RUN   TestFieldAccessLineSchema
+    pbt_test.go:1299: [rapid] OK, passed 100 tests (1.052184ms)
+--- PASS: TestFieldAccessLineSchema (0.00s)
+=== RUN   TestSingleLineLogOutput
+    pbt_test.go:1407: [rapid] OK, passed 100 tests (1.356743ms)
+--- PASS: TestSingleLineLogOutput (0.00s)
+=== RUN   TestGenericObjectFormatting
+=== RUN   TestGenericObjectFormatting/empty_toString_renders_class_name_only
+=== RUN   TestGenericObjectFormatting/toString_equals_class_name_renders_class_only
+=== RUN   TestGenericObjectFormatting/toString_starts_with_className_at_hex
+=== RUN   TestGenericObjectFormatting/toString_contains_simple_name_case_insensitive
+=== RUN   TestGenericObjectFormatting/toString_contains_simple_name_different_case
+=== RUN   TestGenericObjectFormatting/toString_exceeds_120_chars_is_truncated
+=== RUN   TestGenericObjectFormatting/toString_exactly_120_chars_not_truncated
+--- PASS: TestGenericObjectFormatting (0.00s)
+    --- PASS: TestGenericObjectFormatting/empty_toString_renders_class_name_only (0.00s)
+    --- PASS: TestGenericObjectFormatting/toString_equals_class_name_renders_class_only (0.00s)
+    --- PASS: TestGenericObjectFormatting/toString_starts_with_className_at_hex (0.00s)
+    --- PASS: TestGenericObjectFormatting/toString_contains_simple_name_case_insensitive (0.00s)
+    --- PASS: TestGenericObjectFormatting/toString_contains_simple_name_different_case (0.00s)
+    --- PASS: TestGenericObjectFormatting/toString_exceeds_120_chars_is_truncated (0.00s)
+    --- PASS: TestGenericObjectFormatting/toString_exactly_120_chars_not_truncated (0.00s)
+=== RUN   TestMethodCallLineSchema
+    pbt_test.go:1645: [rapid] OK, passed 100 tests (1.661001ms)
+--- PASS: TestMethodCallLineSchema (0.00s)
+=== RUN   TestThreeTierGateFiltering
+    pbt_test.go:1723: [rapid] OK, passed 100 tests (1.227713ms)
+--- PASS: TestThreeTierGateFiltering (0.00s)
+=== RUN   TestCustomObjectParsers
+=== RUN   TestCustomObjectParsers/Intent/full_fields
+=== RUN   TestCustomObjectParsers/Intent/only_act
+=== RUN   TestCustomObjectParsers/Intent/empty
+=== RUN   TestCustomObjectParsers/Bundle/empty
+=== RUN   TestCustomObjectParsers/Bundle/non_empty
+=== RUN   TestCustomObjectParsers/Uri/content_uri
+=== RUN   TestCustomObjectParsers/File/path
+=== RUN   TestCustomObjectParsers/ComponentName/basic
+=== RUN   TestCustomObjectParsers/Generic/empty_toString
+=== RUN   TestCustomObjectParsers/Generic/toString_equals_className
+=== RUN   TestCustomObjectParsers/Generic/className_at_hex
+=== RUN   TestCustomObjectParsers/Generic/toString_truncation
+=== RUN   TestCustomObjectParsers/NoColor/all_parsers
+--- PASS: TestCustomObjectParsers (0.00s)
+    --- PASS: TestCustomObjectParsers/Intent/full_fields (0.00s)
+    --- PASS: TestCustomObjectParsers/Intent/only_act (0.00s)
+    --- PASS: TestCustomObjectParsers/Intent/empty (0.00s)
+    --- PASS: TestCustomObjectParsers/Bundle/empty (0.00s)
+    --- PASS: TestCustomObjectParsers/Bundle/non_empty (0.00s)
+    --- PASS: TestCustomObjectParsers/Uri/content_uri (0.00s)
+    --- PASS: TestCustomObjectParsers/File/path (0.00s)
+    --- PASS: TestCustomObjectParsers/ComponentName/basic (0.00s)
+    --- PASS: TestCustomObjectParsers/Generic/empty_toString (0.00s)
+    --- PASS: TestCustomObjectParsers/Generic/toString_equals_className (0.00s)
+    --- PASS: TestCustomObjectParsers/Generic/className_at_hex (0.00s)
+    --- PASS: TestCustomObjectParsers/Generic/toString_truncation (0.00s)
+    --- PASS: TestCustomObjectParsers/NoColor/all_parsers (0.00s)
+=== RUN   TestCallerAddressFormatting
+    pbt_test.go:2031: [rapid] OK, passed 100 tests (418.918µs)
+--- PASS: TestCallerAddressFormatting (0.00s)
+=== RUN   TestExceptionEventFormatting
+=== RUN   TestExceptionEventFormatting/ExceptionCheck/true
+=== RUN   TestExceptionEventFormatting/ExceptionCheck/false
+=== RUN   TestExceptionEventFormatting/ExceptionOccurred/non_null
+=== RUN   TestExceptionEventFormatting/ExceptionOccurred/null
+=== RUN   TestExceptionEventFormatting/Throw
+=== RUN   TestExceptionEventFormatting/ThrowNew
+=== RUN   TestExceptionEventFormatting/ExceptionClear
+=== RUN   TestExceptionEventFormatting/FatalError
+--- PASS: TestExceptionEventFormatting (0.00s)
+    --- PASS: TestExceptionEventFormatting/ExceptionCheck/true (0.00s)
+    --- PASS: TestExceptionEventFormatting/ExceptionCheck/false (0.00s)
+    --- PASS: TestExceptionEventFormatting/ExceptionOccurred/non_null (0.00s)
+    --- PASS: TestExceptionEventFormatting/ExceptionOccurred/null (0.00s)
+    --- PASS: TestExceptionEventFormatting/Throw (0.00s)
+    --- PASS: TestExceptionEventFormatting/ThrowNew (0.00s)
+    --- PASS: TestExceptionEventFormatting/ExceptionClear (0.00s)
+    --- PASS: TestExceptionEventFormatting/FatalError (0.00s)
+=== RUN   TestGenJNIValue
+    testutil_test.go:323: [rapid] OK, passed 100 tests (138.199µs)
+--- PASS: TestGenJNIValue (0.00s)
+=== RUN   TestGenCallFrame
+    testutil_test.go:332: [rapid] OK, passed 100 tests (1.649271ms)
+--- PASS: TestGenCallFrame (0.00s)
+=== RUN   TestGenConfig
+    testutil_test.go:350: [rapid] OK, passed 100 tests (1.177474ms)
+--- PASS: TestGenConfig (0.00s)
+PASS
+ok  	jnilog	0.028s
