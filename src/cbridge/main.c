@@ -173,6 +173,56 @@ static void* hooked_loader_android_dlopen_ext(const char* filename, int flags,
     return handle;
 }
 
+/* Read the current memory protection of the page containing `addr` from
+ * /proc/self/maps, as PROT_* flags.  Returns -1 if the range isn't found or the
+ * line can't be parsed (caller falls back conservatively).  Only the leading
+ * "lo-hi perms" fields are needed, so the 512-byte line cap is irrelevant here
+ * (perms sit at the very start of the line). (F3) */
+static int page_prot_from_maps(uintptr_t addr) {
+    FILE* f = fopen("/proc/self/maps", "re");
+    if (!f) return -1;
+    char line[512];
+    int prot = -1;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long lo = 0, hi = 0;   /* 64-bit on LP64 aarch64 — holds a full VA */
+        char perms[5] = {0};
+        if (sscanf(line, "%lx-%lx %4s", &lo, &hi, perms) == 3) {
+            if (addr >= (uintptr_t)lo && addr < (uintptr_t)hi) {
+                prot = 0;
+                if (perms[0] == 'r') prot |= PROT_READ;
+                if (perms[1] == 'w') prot |= PROT_WRITE;
+                if (perms[2] == 'x') prot |= PROT_EXEC;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return prot;
+}
+
+/* Atomically swap a single GOT slot to `new_fn`, restoring the page's ORIGINAL
+ * protection afterward (F3).  An 8-byte-aligned GOT slot never spans two pages,
+ * so one page is sufficient — the old code mprotect'd a gratuitous 2-page span
+ * and clobbered the neighbouring page's perms.  Original perms are read from
+ * /proc/self/maps and restored exactly (full-RELRO libs are r--p, but vendor
+ * builds may differ); on a parse failure we conservatively restore PROT_READ
+ * and warn.  The store is release-ordered: in stealth mode the constructor runs
+ * on a detached worker thread while the process is live, so another thread may
+ * dispatch through this slot concurrently. */
+static void patch_got_slot(void** got_slot, void* new_fn, long page_size,
+                           const char* what) {
+    void* page = (void*)((uintptr_t)got_slot & ~((uintptr_t)page_size - 1));
+    int orig_prot = page_prot_from_maps((uintptr_t)got_slot);
+    real_mprotect(page, (size_t)page_size, PROT_READ | PROT_WRITE);
+    __atomic_store_n((uintptr_t*)got_slot, (uintptr_t)new_fn, __ATOMIC_RELEASE);
+    if (orig_prot < 0) {
+        LOG_DIRECT(ANDROID_LOG_WARN,
+                   DL_TAG " GOT page perms unread for %s; restoring PROT_READ", what);
+        orig_prot = PROT_READ;
+    }
+    real_mprotect(page, (size_t)page_size, orig_prot);
+}
+
 static void install_loader_dlopen_hook(void) {
     uintptr_t base = maps_find_lib_base("/libdl.so");
     if (!base) {
@@ -240,19 +290,8 @@ static void install_loader_dlopen_hook(void) {
         if (!found_dlopen && strcmp(sym_name, "__loader_dlopen") == 0) {
             void** got_slot = (void**)(base + rela_plt[i].r_offset);
             orig_loader_dlopen = (loader_dlopen_fn)*got_slot;
-            void* page = (void*)((uintptr_t)got_slot & ~((uintptr_t)page_size - 1));
-            real_mprotect(page, (size_t)page_size * 2, PROT_READ | PROT_WRITE);
-            /* Use a release-store for the GOT slot. In stealth-injection mode
-             * the library constructor runs in a detached worker thread while
-             * the rest of the process is fully live (see library_constructor
-             * below); another thread could resolve and execute through this
-             * slot concurrently with the plain store, leading to a torn
-             * pointer dispatch. uintptr_t-typed __atomic_store is wait-free
-             * on aarch64 for the 8-byte-aligned GOT slot. */
-            __atomic_store_n((uintptr_t *)got_slot,
-                             (uintptr_t)(void*)hooked_loader_dlopen,
-                             __ATOMIC_RELEASE);
-            real_mprotect(page, (size_t)page_size * 2, PROT_READ);
+            patch_got_slot(got_slot, (void*)hooked_loader_dlopen, page_size,
+                           "__loader_dlopen");
             LOG_DIRECT(ANDROID_LOG_INFO,
                        DL_TAG " hook installed "
                        DL_KEY("fn")   C_MAGENTA  "__loader_dlopen" C_RESET " "
@@ -263,12 +302,8 @@ static void install_loader_dlopen_hook(void) {
         } else if (!found_dlopen_ext && strcmp(sym_name, "__loader_android_dlopen_ext") == 0) {
             void** got_slot = (void**)(base + rela_plt[i].r_offset);
             orig_loader_android_dlopen_ext = (loader_android_dlopen_ext_fn)*got_slot;
-            void* page = (void*)((uintptr_t)got_slot & ~((uintptr_t)page_size - 1));
-            real_mprotect(page, (size_t)page_size * 2, PROT_READ | PROT_WRITE);
-            __atomic_store_n((uintptr_t *)got_slot,
-                             (uintptr_t)(void*)hooked_loader_android_dlopen_ext,
-                             __ATOMIC_RELEASE);
-            real_mprotect(page, (size_t)page_size * 2, PROT_READ);
+            patch_got_slot(got_slot, (void*)hooked_loader_android_dlopen_ext, page_size,
+                           "__loader_android_dlopen_ext");
             LOG_DIRECT(ANDROID_LOG_INFO,
                        DL_TAG " hook installed "
                        DL_KEY("fn")   C_MAGENTA  "__loader_android_dlopen_ext" C_RESET " "
@@ -503,11 +538,19 @@ static void try_install_hooks(JavaVM* vm) {
 static void install_vm_hooks(JavaVM* vm) {
     pthread_mutex_lock(&g_vm_hook_lock);
     if (g_original_vm_table == NULL) {
+        /* Fully populate the hooked table BEFORE it is ever published (F23): the
+         * memcpy + GetEnv patch happen under the lock and only once (guarded by
+         * g_original_vm_table==NULL), so the table is never memcpy'd into while
+         * already reachable via *vm. */
         g_original_vm_table = *vm;
         memcpy(&g_hooked_vm_table, g_original_vm_table, sizeof(g_hooked_vm_table));
         g_hooked_vm_table.GetEnv = hooked_vm_GetEnv;
     }
-    *vm = &g_hooked_vm_table;
+    /* Publish with a release-store so a reader on another core that observes the
+     * new table pointer via (*vm)->... is guaranteed to also see the fully
+     * populated table contents (the plain store left this ordering implicit). */
+    __atomic_store_n(vm, (const struct JNIInvokeInterface*)&g_hooked_vm_table,
+                     __ATOMIC_RELEASE);
     g_hooked_vm = vm;
     pthread_mutex_unlock(&g_vm_hook_lock);
 }

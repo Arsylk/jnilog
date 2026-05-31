@@ -314,7 +314,15 @@ so the second page is gratuitous and its perms are clobbered too.
   parsing fails, but log a warning.
 
 **Acceptance:** patch succeeds on device; libdl keeps functioning (dlopen still works post-patch);
-no SIGSEGV writing the GOT page later. ☐ device-tested
+no SIGSEGV writing the GOT page later. ☑ device-tested
+**Implementation:** new `patch_got_slot()` mprotects a **single** page (the 8-byte-aligned GOT slot
+never spans two pages, so the old 2-page span was gratuitous and clobbered the neighbour's perms);
+`page_prot_from_maps()` reads the page's current `rwxp` from `/proc/self/maps` and the slot is
+restored to *exactly* those perms (conservative `PROT_READ` + warning only on parse failure). Both
+dlopen GOT swaps go through it.
+**Device:** dlopen hook installed (`__loader_dlopen` + `__loader_android_dlopen_ext`) AND fired
+(`[dlopen] open …libpairipcore.so`); libdl still works; 0 "perms unread" warnings; 0 libdl/libjnilog
+SIGSEGV across a 17902-line run.
 
 ---
 
@@ -325,7 +333,13 @@ half-populated table.
 **Fix:** build into a **local** `JNINativeInterface tmp` (or a second static), fully populate,
 then publish with a single `__atomic_store_n(vm, &g_hooked_vm_table, __ATOMIC_RELEASE)` after the
 table is complete. Never memcpy into the table that is already published.
-**Acceptance:** stress install during live JNI traffic (inject mid-run); no crash. ☐ device-tested
+**Acceptance:** stress install during live JNI traffic (inject mid-run); no crash. ☑ device-tested
+**Implementation:** the hooked VM table is fully populated under `g_vm_hook_lock` exactly once (guard
+unchanged, so it is never memcpy'd while published), and the publish is now a single
+`__atomic_store_n(vm, &g_hooked_vm_table, __ATOMIC_RELEASE)` so a reader observing the new table
+pointer also sees the populated contents.
+**Device:** GetEnv-driven hook install still works — full JNI rendering (4956 NewObjectV etc.) across
+17902 lines, no crash.
 
 ---
 
