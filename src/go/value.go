@@ -198,20 +198,22 @@ func buildJNIValue(kind JNIKind, raw string) JNIValue {
 	case KindFloat, KindDouble:
 		v.Float, _ = strconv.ParseFloat(raw, 64)
 	case KindString:
-		v.Str = raw
+		// Embedded content (arg value / array item): reverse F9 escaping.
+		v.Str = unescapeWireContent(raw)
 	case KindClass:
-		v.Str = normalizeDots(raw)
+		v.Str = normalizeDots(unescapeWireContent(raw))
 	case KindObject:
 		// Null sentinel from vis_encode_array_items('L'): literal "null"
 		if raw == "null" {
 			return NullValue
 		}
-		// raw = "class/Name\x03toStringValue" or just "class/Name"
+		// raw = "class/Name\x03toStringValue" or just "class/Name" (each part
+		// F9-escaped). Split on the (unescaped) \x03 separator, then unescape.
 		if idx := strings.IndexByte(raw, '\x03'); idx >= 0 {
-			v.Str = normalizeDots(raw[:idx])
-			v.Extra = raw[idx+1:]
+			v.Str = normalizeDots(unescapeWireContent(raw[:idx]))
+			v.Extra = unescapeWireContent(raw[idx+1:])
 		} else {
-			v.Str = normalizeDots(raw)
+			v.Str = normalizeDots(unescapeWireContent(raw))
 		}
 	case KindArray:
 		v.Str = raw
@@ -241,6 +243,70 @@ func buildJNIValue(kind JNIKind, raw string) JNIValue {
 		v.Str = raw
 	}
 	return v
+}
+
+// Wire content escaping (F9).  Values embedded inside the \x01-\x04 framed
+// arg/array/chunk encoding (string contents, class names, toString results) may
+// themselves contain those framing bytes, the deferred-render marker \x1A, or
+// the escape byte — which would corrupt the frame split (and \x1A would be
+// misread as a placeholder).  The C encoder (vis_append_escaped) and the Go
+// chunk builder (renderRefChunk) emit such a byte b as (\x05, b^0x40); the
+// decoder reverses it here.  Escaping is identity for normal content, so the
+// rendered output is byte-identical for the common case — only strings that
+// actually contain those control bytes are affected (previously corrupt).
+//
+// Applied ONLY to embedded content (buildJNIValue / parseRenderedChunk), never
+// to standalone wire slots (ret_str, receiver_str, …), which are u16-length-
+// framed on the datagram and so carry arbitrary bytes verbatim already.
+const wireEscByte = 0x05
+
+func unescapeWireContent(s string) string {
+	if strings.IndexByte(s, wireEscByte) < 0 {
+		return s
+	}
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == wireEscByte && i+1 < len(s) {
+			out = append(out, s[i+1]^0x40)
+			i++
+			continue
+		}
+		out = append(out, s[i])
+	}
+	return string(out)
+}
+
+// escapeWireContent is the inverse of unescapeWireContent.  Used by the Go-side
+// chunk builder (renderRefChunk) and by the test wire encoder so both match the
+// C encoder.
+func escapeWireContent(s string) string {
+	needs := false
+	for i := 0; i < len(s); i++ {
+		if wireByteNeedsEscape(s[i]) {
+			needs = true
+			break
+		}
+	}
+	if !needs {
+		return s
+	}
+	out := make([]byte, 0, len(s)+8)
+	for i := 0; i < len(s); i++ {
+		if b := s[i]; wireByteNeedsEscape(b) {
+			out = append(out, wireEscByte, b^0x40)
+		} else {
+			out = append(out, b)
+		}
+	}
+	return string(out)
+}
+
+func wireByteNeedsEscape(b byte) bool {
+	switch b {
+	case 0x01, 0x02, 0x03, 0x04, 0x05, 0x1A:
+		return true
+	}
+	return false
 }
 
 // normalizeDots converts JNI slash-separated class names to dotted form.

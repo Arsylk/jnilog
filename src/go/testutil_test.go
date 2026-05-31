@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"pgregory.net/rapid"
@@ -43,6 +44,25 @@ func joinDots(parts []string) string {
 // interfere with wire protocol separators (\x01, \x02, \x03, \x04).
 func genSafeString(t *rapid.T) string {
 	return rapid.StringMatching(`[a-zA-Z0-9 _./:@#$%^&*()+=\-]{0,50}`).Draw(t, "safeStr")
+}
+
+// genTrickyString draws strings containing the bytes the wire encoding must
+// survive (F9): the frame delimiters \x01-\x04, the escape byte \x05, the
+// deferred-render marker \x1A, newlines/tabs, and multi-byte Unicode — exactly
+// what genSafeString omits (which previously masked the delimiter-in-string
+// corruption).
+func genTrickyString(t *rapid.T) string {
+	palette := []string{
+		"\x01", "\x02", "\x03", "\x04", "\x05", "\x1a", "\n", "\t",
+		"a", "Z", "9", " ", "/", ".", "é", "中", "\U0001F600",
+	}
+	n := rapid.IntRange(0, 24).Draw(t, "trickyLen")
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		idx := rapid.IntRange(0, len(palette)-1).Draw(t, fmt.Sprintf("trickyPart%d", i))
+		b.WriteString(palette[idx])
+	}
+	return b.String()
 }
 
 // genHexAddress generates a hex address string like "0x7f1234abcd".

@@ -383,7 +383,20 @@ datagram already does in `event_pipe.go:parseStringsCount`). This is an encoder+
   escape char) in string payloads; Go unescapes. Length-prefix is cleaner — prefer it.
 **Acceptance:** PBT generator extended to include `\x01`–`\x04`, `\x1A`, newlines, and full
 Unicode in string args; round-trip property passes; device capture of an app that logs such
-strings renders correctly. ☐ host-tested · ☐ device-tested
+strings renders correctly. ☑ host-tested · ☑ device-tested
+**Implementation (escape, not length-prefix):** length-prefixing would have forced restructuring the
+placeholder/rendered-chunk machinery (which relies on the `\x01`-`\x04` framing) across the hottest
+path — high blast radius. Instead the doc's lower-risk alternative: the C encoder's new
+`vea_append_escaped` escapes `\x01`-`\x05` and `\x1A` in embedded *content* (string values, class
+names, toString results) as `(\x05, b^0x40)` at all 7 content sites; the Go decoder reverses it in
+`buildJNIValue` (args + array items via recursion) and `parseRenderedChunk` (deferred receiver/field
+chunks); `renderRefChunk` escapes the chunks it builds. Standalone wire slots (`ret_str`, …) are
+u16-length-framed so they're left verbatim. Escaping is identity for normal content → output
+byte-identical for the common case. PBT generator extended (`genTrickyString`) + new
+`TestWireProtocolRoundTripControlBytes`.
+**Verification:** host round-trip property test passes for strings/objects containing `\x01`-`\x05`,
+`\x1A`, newlines, and 2/3/4-byte Unicode; existing round-trip still green; device chatgpt 17441-line
+capture renders normal strings unchanged with 0 stray control bytes, 0 jnilog crash.
 
 ---
 

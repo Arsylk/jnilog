@@ -334,8 +334,13 @@ func renderRefChunk(gref uintptr) string {
 	default:
 		return "p\x01null\x02"
 	}
+	// Escape the content (F9) so a class name / toString() containing \x01-\x04,
+	// \x1A, or the escape byte can't corrupt this chunk's framing once it is
+	// substituted into encoded_args (decoded by buildJNIValue) or parsed as a
+	// deferred receiver/field value (parseRenderedChunk) — both unescape.
+	str = escapeWireContent(str)
 	if extra != "" {
-		return string(sig) + "\x01" + str + "\x03" + extra + "\x02"
+		return string(sig) + "\x01" + str + "\x03" + escapeWireContent(extra) + "\x02"
 	}
 	return string(sig) + "\x01" + str + "\x02"
 }
@@ -366,12 +371,14 @@ func parseRenderedChunk(chunk string) (kind int, str string, extra string) {
 		if len(body) > 0 && body[len(body)-1] == '\x02' {
 			body = body[:len(body)-1]
 		}
-		// Split body on "\x03" for L kind (class \x03 toString)
+		// Split body on "\x03" for L kind (class \x03 toString), then reverse
+		// the F9 content escaping — this chunk's consumers (decodeSingleReceiver
+		// / buildReturnValue) read standalone fields and do NOT unescape.
 		if idx := indexByte(body, '\x03'); idx >= 0 {
-			str = body[:idx]
-			extra = body[idx+1:]
+			str = unescapeWireContent(body[:idx])
+			extra = unescapeWireContent(body[idx+1:])
 		} else {
-			str = body
+			str = unescapeWireContent(body)
 		}
 		if kind == 0 {
 			str = ""

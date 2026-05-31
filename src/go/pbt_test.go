@@ -82,7 +82,7 @@ func encodeArgs(values []JNIValue) string {
 		buf.WriteString(encodePrimaryValue(v))
 		if v.Kind == KindObject && v.Extra != "" {
 			buf.WriteByte('\x03')
-			buf.WriteString(v.Extra)
+			buf.WriteString(escapeWireContent(v.Extra)) // mirror C vea_append_escaped (F9)
 		}
 		buf.WriteByte('\x02')
 	}
@@ -101,13 +101,13 @@ func encodePrimaryValue(v JNIValue) string {
 	case KindDouble:
 		return strconv.FormatFloat(v.Float, 'g', -1, 64)
 	case KindString:
-		return v.Str
+		return escapeWireContent(v.Str) // mirror C vea_append_escaped (F9)
 	case KindClass:
 		// Class names are stored with dots; wire uses slashes
-		return strings.ReplaceAll(v.Str, ".", "/")
+		return escapeWireContent(strings.ReplaceAll(v.Str, ".", "/"))
 	case KindObject:
 		// Object primary is class name (slash-separated on wire)
-		return strings.ReplaceAll(v.Str, ".", "/")
+		return escapeWireContent(strings.ReplaceAll(v.Str, ".", "/"))
 	case KindArray:
 		return encodeArrayValue(v)
 	case KindPointer:
@@ -163,14 +163,14 @@ func encodeItemValue(v JNIValue) string {
 	case KindDouble:
 		return strconv.FormatFloat(v.Float, 'g', -1, 64)
 	case KindString:
-		return v.Str
+		return escapeWireContent(v.Str) // mirror C vea_append_escaped (F9)
 	case KindClass:
-		return strings.ReplaceAll(v.Str, ".", "/")
+		return escapeWireContent(strings.ReplaceAll(v.Str, ".", "/"))
 	case KindObject:
 		if v.Extra != "" {
-			return strings.ReplaceAll(v.Str, ".", "/") + "\x03" + v.Extra
+			return escapeWireContent(strings.ReplaceAll(v.Str, ".", "/")) + "\x03" + escapeWireContent(v.Extra)
 		}
-		return strings.ReplaceAll(v.Str, ".", "/")
+		return escapeWireContent(strings.ReplaceAll(v.Str, ".", "/"))
 	case KindPointer:
 		return v.Str
 	default:
@@ -207,6 +207,49 @@ func TestWireProtocolRoundTrip(t *testing.T) {
 		// Assert each value matches
 		for i := range values {
 			assertJNIValueEqual(t, i, values[i], decoded[i])
+		}
+	})
+}
+
+// TestWireProtocolRoundTripControlBytes verifies F9: string values and
+// toString() extras whose bytes include the frame delimiters \x01-\x04, the
+// escape byte \x05, the deferred-render marker \x1A, newlines, or multi-byte
+// Unicode survive the encode→decode round-trip intact. Before F9 these bytes
+// were emitted raw and the \x01-\x04 split corrupted decoding; genSafeString
+// excluded them, masking the bug.
+func TestWireProtocolRoundTripControlBytes(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		n := rapid.IntRange(0, 6).Draw(t, "nArgs")
+		values := make([]JNIValue, n)
+		for i := range values {
+			if rapid.Bool().Draw(t, fmt.Sprintf("isObj%d", i)) {
+				// Object: tricky bytes in both the class name and the toString
+				// extra exercise the \x03 class/extra split too.
+				values[i] = JNIValue{Kind: KindObject, Str: "pkg/" + genTrickyString(t), Extra: genTrickyString(t)}
+			} else {
+				values[i] = JNIValue{Kind: KindString, Str: genTrickyString(t)}
+			}
+		}
+		encoded := encodeArgs(values)
+		decoded := decodeArgs(encoded)
+		if len(decoded) != len(values) {
+			t.Fatalf("length mismatch: %d vs %d (encoded=%q)", len(decoded), len(values), encoded)
+		}
+		for i := range values {
+			switch values[i].Kind {
+			case KindString:
+				if decoded[i].Str != values[i].Str {
+					t.Fatalf("arg[%d] string round-trip: got %q want %q", i, decoded[i].Str, values[i].Str)
+				}
+			case KindObject:
+				// Class name '/' ↔ '.' normalization is lossy by design, so only
+				// the (non-normalized) toString extra is asserted byte-exact —
+				// its survival proves the \x03 split held despite control bytes
+				// in the class name.
+				if decoded[i].Extra != values[i].Extra {
+					t.Fatalf("arg[%d] object extra round-trip: got %q want %q", i, decoded[i].Extra, values[i].Extra)
+				}
+			}
 		}
 	})
 }

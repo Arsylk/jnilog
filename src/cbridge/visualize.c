@@ -264,6 +264,34 @@ static char *vea_append(char *buf, size_t *len, size_t *cap, const char *src, si
 #define VEA_LIT(b, l, c, s) vea_append(b, l, c, s, strlen(s))
 #define VEA_CH(b, l, c, ch) do { if (b) { char _c = (ch); b = vea_append(b, l, c, &_c, 1); } } while(0)
 
+/* Append app-controlled *content* (a string value, class name, or toString
+ * result), escaping the wire framing bytes \x01-\x04, the deferred-render marker
+ * \x1A, and the escape byte \x05 itself as the two bytes (\x05, b^0x40) (F9).
+ * Without this a Java string / toString() containing those bytes would corrupt
+ * the \x01-\x04 frame split (and \x1A would be misread as a placeholder).
+ * Escaping is identity for normal content (one batched vea_append, same output
+ * as before); the Go side reverses it with unescapeWireContent. */
+static char *vea_append_escaped(char *buf, size_t *len, size_t *cap,
+                                const char *src, size_t n) {
+    if (buf == NULL) return NULL;
+    size_t run = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char b = (unsigned char)src[i];
+        if (b == 0x01 || b == 0x02 || b == 0x03 || b == 0x04 || b == 0x05 || b == 0x1A) {
+            if (run) { buf = vea_append(buf, len, cap, src + i - run, run); run = 0;
+                       if (buf == NULL) return NULL; }
+            char esc[2] = { (char)0x05, (char)(b ^ 0x40) };
+            buf = vea_append(buf, len, cap, esc, 2);
+            if (buf == NULL) return NULL;
+        } else {
+            run++;
+        }
+    }
+    if (run) buf = vea_append(buf, len, cap, src + n - run, run);
+    return buf;
+}
+#define VEA_ESC(b, l, c, s) vea_append_escaped(b, l, c, s, strlen(s))
+
 char* vis_encode_array_items(JNIEnv* env, void* arr, char itemSigChar) {
     if (arr == NULL || !vis_safe_to_call(env)) return strdup("");
 
@@ -397,15 +425,15 @@ char* vis_encode_array_items(JNIEnv* env, void* arr, char itemSigChar) {
                 buf = VEA_LIT(buf, &len, &cap, "null");
             } else if (vis_is_string(env, elem)) {
                 char *sv = vis_string_value_raw(env, elem);
-                if (sv) { buf = vea_append(buf, &len, &cap, sv, strlen(sv)); free(sv); }
+                if (sv) { buf = vea_append_escaped(buf, &len, &cap, sv, strlen(sv)); free(sv); }
                 else buf = VEA_LIT(buf, &len, &cap, "");
             } else {
                 char *cn = vis_object_class_name(env, elem);
                 char *ts = vis_object_tostring_safe(env, elem, cn);
-                if (cn) { buf = vea_append(buf, &len, &cap, cn, strlen(cn)); free(cn); }
+                if (cn) { buf = vea_append_escaped(buf, &len, &cap, cn, strlen(cn)); free(cn); }
                 if (ts) {
                     VEA_CH(buf, &len, &cap, '\x03');
-                    buf = vea_append(buf, &len, &cap, ts, strlen(ts));
+                    buf = vea_append_escaped(buf, &len, &cap, ts, strlen(ts));
                     free(ts);
                 }
             }
@@ -669,18 +697,18 @@ char* vis_encode_typed_args(JNIEnv *env, const char *sig, uintptr_t *extracted, 
                  * len was not advanced — guard the in-place rewrite. */
                 if (buf && len >= 2) buf[len - 2] = 's';
                 char *sv = vis_string_value_raw(env, obj);
-                if (sv) { buf = vea_append(buf, &len, &cap, sv, strlen(sv)); free(sv); }
+                if (sv) { buf = vea_append_escaped(buf, &len, &cap, sv, strlen(sv)); free(sv); }
             } else if (vis_is_class(env, obj)) {
                 if (buf && len >= 2) buf[len - 2] = 'c';
                 char *cn = vis_class_name(env, obj);
-                if (cn) { buf = vea_append(buf, &len, &cap, cn, strlen(cn)); free(cn); }
+                if (cn) { buf = vea_append_escaped(buf, &len, &cap, cn, strlen(cn)); free(cn); }
             } else {
                 char *cn = vis_object_class_name(env, obj);
                 char *ts = vis_object_tostring_safe(env, obj, cn);
-                if (cn) buf = vea_append(buf, &len, &cap, cn, strlen(cn));
+                if (cn) buf = vea_append_escaped(buf, &len, &cap, cn, strlen(cn));
                 if (ts) {
                     VEA_CH(buf, &len, &cap, '\x03');
-                    buf = vea_append(buf, &len, &cap, ts, strlen(ts));
+                    buf = vea_append_escaped(buf, &len, &cap, ts, strlen(ts));
                     free(ts);
                 }
                 free(cn);
