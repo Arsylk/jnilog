@@ -386,7 +386,7 @@ char* vis_encode_array_items(JNIEnv* env, void* arr, char itemSigChar) {
         if (elems) {
             for (jsize i = 0; i < count; i++) {
                 VEA_CH(buf, &len, &cap, '\x04');
-                snprintf(tmp, sizeof(tmp), "%g", (double)elems[i]);
+                snprintf(tmp, sizeof(tmp), "%.9g", (double)elems[i]); /* float: 9 sig digits round-trips (F22) */
                 buf = VEA_LIT(buf, &len, &cap, tmp);
             }
             g_original_jni_table->ReleaseFloatArrayElements(env, (jfloatArray)arr, elems, JNI_ABORT);
@@ -398,7 +398,7 @@ char* vis_encode_array_items(JNIEnv* env, void* arr, char itemSigChar) {
         if (elems) {
             for (jsize i = 0; i < count; i++) {
                 VEA_CH(buf, &len, &cap, '\x04');
-                snprintf(tmp, sizeof(tmp), "%g", elems[i]);
+                snprintf(tmp, sizeof(tmp), "%.17g", elems[i]); /* double: 17 sig digits round-trips (F22) */
                 buf = VEA_LIT(buf, &len, &cap, tmp);
             }
             g_original_jni_table->ReleaseDoubleArrayElements(env, (jdoubleArray)arr, elems, JNI_ABORT);
@@ -486,8 +486,8 @@ char* vis_encode_ptr_array_items(const void* buf, jsize count, char itemSigChar)
         case 'S': snprintf(tmp, sizeof(tmp), "%d", (int)((const jshort*)buf)[i]);   break;
         case 'I': snprintf(tmp, sizeof(tmp), "%d", (int)((const jint*)buf)[i]);     break;
         case 'J': snprintf(tmp, sizeof(tmp), "%lld", (long long)((const jlong*)buf)[i]); break;
-        case 'F': snprintf(tmp, sizeof(tmp), "%g", (double)((const jfloat*)buf)[i]); break;
-        case 'D': snprintf(tmp, sizeof(tmp), "%g", ((const jdouble*)buf)[i]);       break;
+        case 'F': snprintf(tmp, sizeof(tmp), "%.9g",  (double)((const jfloat*)buf)[i]); break; /* F22 */
+        case 'D': snprintf(tmp, sizeof(tmp), "%.17g", ((const jdouble*)buf)[i]);       break; /* F22 */
         default:  snprintf(tmp, sizeof(tmp), "?");                                  break;
         }
         out = VEA_LIT(out, &len, &cap, tmp);
@@ -666,12 +666,18 @@ char* vis_encode_typed_args(JNIEnv *env, const char *sig, uintptr_t *extracted, 
         case 'F': {
             float fv; uint32_t u32 = (uint32_t)val;
             memcpy(&fv, &u32, sizeof(fv));
-            snprintf(tmp, sizeof(tmp), "%g", (double)fv);
+            snprintf(tmp, sizeof(tmp), "%.9g", (double)fv); /* float round-trips at 9 sig digits (F22) */
             buf = VEA_LIT(buf, &len, &cap, tmp); break;
         }
         case 'D': {
+            /* val carries the raw 64-bit double bits in a uintptr_t; the memcpy
+             * is only correct when uintptr_t is at least 8 bytes (LP64).  Fail
+             * the build loudly rather than silently capture 4 of 8 bytes if this
+             * is ever reused on an ILP32 target (F22). */
+            _Static_assert(sizeof(uintptr_t) >= sizeof(double),
+                           "double bits don't fit uintptr_t (need LP64)");
             double dv; memcpy(&dv, &val, sizeof(dv));
-            snprintf(tmp, sizeof(tmp), "%g", dv);
+            snprintf(tmp, sizeof(tmp), "%.17g", dv); /* double round-trips at 17 sig digits (F22) */
             buf = VEA_LIT(buf, &len, &cap, tmp); break;
         }
         case '[': {

@@ -462,7 +462,14 @@ hazard) is gone entirely. Folded into the F10 buffer-copy rewrite.
 `uintptr_t`).
 **Fix:** use `%.17g` for round-trippable doubles; `_Static_assert(sizeof(uintptr_t) >= 8)` (or
 guard the double path) so a future 32-bit reuse fails loudly rather than silently capturing 4 of 8
-bytes. arm64-only today, so low risk. ☐ done
+bytes. arm64-only today, so low risk. ☑ done
+**Implementation:** all 6 `%g` sites now use `%.9g` for floats (9 sig digits round-trips IEEE-754
+binary32) and `%.17g` for doubles (17 for binary64), so the exact value reaches Go losslessly
+instead of being truncated to ~6 digits on the wire. The Go formatter still displays via
+`strconv.FormatFloat(…, 'g', -1, …)` (shortest round-trippable), so on-screen output is identical
+for round values and merely *more accurate* for precise ones — no readability regression.
+`_Static_assert(sizeof(uintptr_t) >= sizeof(double))` guards the `'D'` raw-bits memcpy so an ILP32
+reuse fails the build instead of silently capturing 4 of 8 bytes.
 
 ---
 
