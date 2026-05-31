@@ -122,24 +122,29 @@ void cache_method_signature(jmethodID method_id, const char *name, const char *s
   (void)pthread_rwlock_unlock(&g_method_cache_lock);
 }
 
-method_info_t lookup_method_info(jmethodID method_id) {
+method_info_t lookup_method_info(jmethodID method_id,
+                                 char *name_buf, size_t name_sz,
+                                 char *sig_buf, size_t sig_sz,
+                                 char *clazz_buf, size_t clazz_sz) {
   method_info_t info = {NULL, NULL, NULL};
+  if (name_sz)  name_buf[0]  = '\0';
+  if (sig_sz)   sig_buf[0]   = '\0';
+  if (clazz_sz) clazz_buf[0] = '\0';
   if (method_id == NULL) return info;
   (void)pthread_rwlock_rdlock(&g_method_cache_lock);
   size_t start = method_cache_hash(method_id);
   for (size_t n = 0; n < METHOD_CACHE_SIZE; ++n) {
     size_t idx = (start + n) & (METHOD_CACHE_SIZE - 1u);
     const method_sig_entry_t *entry = &g_method_cache[idx];
-    if (!entry->in_use) {
-      (void)pthread_rwlock_unlock(&g_method_cache_lock);
-      return info;
-    }
+    if (!entry->in_use) break;
     if (entry->method_id == method_id) {
-      info.name = entry->name;
-      info.sig = entry->signature;
-      info.clazz = entry->clazz;
-      (void)pthread_rwlock_unlock(&g_method_cache_lock);
-      return info;
+      /* Copy each field into the caller's buffer WHILE holding the read lock,
+       * so a concurrent cache_method_signature wrlock cannot torn-overwrite a
+       * slot between the lookup and the copy (F10). */
+      if (name_sz)  { strncpy(name_buf,  entry->name,      name_sz  - 1u); name_buf[name_sz   - 1u] = '\0'; info.name  = name_buf; }
+      if (sig_sz)   { strncpy(sig_buf,   entry->signature, sig_sz   - 1u); sig_buf[sig_sz     - 1u] = '\0'; info.sig   = sig_buf; }
+      if (clazz_sz) { strncpy(clazz_buf, entry->clazz,     clazz_sz - 1u); clazz_buf[clazz_sz - 1u] = '\0'; info.clazz = clazz_buf; }
+      break;
     }
   }
   (void)pthread_rwlock_unlock(&g_method_cache_lock);
@@ -202,35 +207,47 @@ void cache_field_signature(jfieldID field_id, const char *name, const char *sig,
   (void)pthread_rwlock_unlock(&g_field_cache_lock);
 }
 
-field_info_t lookup_field_info(jfieldID field_id) {
+field_info_t lookup_field_info(jfieldID field_id,
+                               char *name_buf, size_t name_sz,
+                               char *sig_buf, size_t sig_sz,
+                               char *clazz_buf, size_t clazz_sz) {
   field_info_t info = {NULL, NULL, NULL};
+  if (name_sz)  name_buf[0]  = '\0';
+  if (sig_sz)   sig_buf[0]   = '\0';
+  if (clazz_sz) clazz_buf[0] = '\0';
   if (field_id == NULL) return info;
 
-  const char* art_name = art_get_field_name(field_id);
-  
+  int found = 0;
   (void)pthread_rwlock_rdlock(&g_field_cache_lock);
   size_t start = field_cache_hash(field_id);
   for (size_t n = 0; n < METHOD_CACHE_SIZE; ++n) {
     size_t idx = (start + n) & (METHOD_CACHE_SIZE - 1u);
     const field_sig_entry_t *entry = &g_field_cache[idx];
-    if (!entry->in_use) {
-      break;
-    }
+    if (!entry->in_use) break;
     if (entry->field_id == field_id) {
-      info.name = entry->name;
-      info.sig = entry->signature;
-      info.clazz = entry->clazz;
+      /* Copy under the read lock — see F10 note in lookup_method_info. */
+      if (name_sz)  { strncpy(name_buf,  entry->name,      name_sz  - 1u); name_buf[name_sz   - 1u] = '\0'; info.name  = name_buf; }
+      if (sig_sz)   { strncpy(sig_buf,   entry->signature, sig_sz   - 1u); sig_buf[sig_sz     - 1u] = '\0'; info.sig   = sig_buf; }
+      if (clazz_sz) { strncpy(clazz_buf, entry->clazz,     clazz_sz - 1u); clazz_buf[clazz_sz - 1u] = '\0'; info.clazz = clazz_buf; }
+      found = 1;
       break;
     }
   }
   (void)pthread_rwlock_unlock(&g_field_cache_lock);
 
-  if (art_name && info.name == NULL) {
-    static __thread char art_name_buf[128];
-    strncpy(art_name_buf, art_name, sizeof(art_name_buf)-1);
-    info.name = art_name_buf;
+  /* F20: consult ART for the field name ONLY on a cache miss (the old code
+   * called art_get_field_name on every lookup and discarded it on a hit).
+   * Copy straight into the caller's buffer, so there is also no shared
+   * __thread art_name_buf whose "valid until the next same-thread call"
+   * lifetime would need documenting. */
+  if (!found && name_sz) {
+    const char *art_name = art_get_field_name(field_id);
+    if (art_name) {
+      strncpy(name_buf, art_name, name_sz - 1u);
+      name_buf[name_sz - 1u] = '\0';
+      info.name = name_buf;
+    }
   }
-
   return info;
 }
 
@@ -283,6 +300,12 @@ static int cfg_lookup(const char *name, int *out) {
     uint32_t idx = (hash + (uint32_t)i) & CONFIG_CACHE_MASK;
     config_cache_entry_t *e = &g_cfg_cache[idx];
     if (e->result == -1) {
+      /* F18: drop the lock for the (blocking) Go round-trip.  Two threads
+       * racing the SAME fresh key can both reach here and both query Go; that
+       * is harmless — the re-check below lets only the first populate the slot,
+       * and the loser's identical result is simply discarded (not leaked).
+       * e->owned (strdup) is intentionally never freed: this is a
+       * process-lifetime cache bounded by CONFIG_CACHE_SIZE. */
       pthread_mutex_unlock(&g_cfg_cache_lock);
       int allowed = 1;
       if (config_function_blacklisted((char *)name)) allowed = 0;

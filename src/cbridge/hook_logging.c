@@ -92,16 +92,6 @@ void method_log_ctx_destroy(method_log_ctx_t *ctx) {
     ctx->encoded_args   = NULL;
 }
 
-/* copy_cache_str — copy a possibly-NULL cache string into a fixed buffer and
- * point `out_p` at it, returning NULL when src is NULL so callers can tell. */
-static void copy_cache_str(const char **out_p, char *buf, size_t bufsz,
-                            const char *src) {
-    if (!src) { *out_p = NULL; buf[0] = '\0'; return; }
-    strncpy(buf, src, bufsz - 1);
-    buf[bufsz - 1] = '\0';
-    *out_p = buf;
-}
-
 static void prepare_method_log_ctx_common(method_log_ctx_t *ctx, JNIEnv *env,
                                           void *receiver, jmethodID method_id,
                                           void *caller) {
@@ -119,13 +109,18 @@ static void prepare_method_log_ctx_common(method_log_ctx_t *ctx, JNIEnv *env,
     ctx->receiver_kind = (int)classify_object(env, receiver);
     fill_object_strings(env, receiver, &ctx->receiver_str, &ctx->receiver_extra);
 
-    /* Method info from cache — copy into ctx-owned buffers so a concurrent
-     * cache_method_signature on the same slot cannot torn-overwrite the
-     * strings while we still hold them across later vis_* sub-calls. */
-    method_info_t info = lookup_method_info(method_id);
-    copy_cache_str(&ctx->sig,         ctx->sig_buf,         sizeof(ctx->sig_buf),         info.sig);
-    copy_cache_str(&ctx->method_name, ctx->method_name_buf, sizeof(ctx->method_name_buf), info.name);
-    copy_cache_str(&ctx->clazz_name,  ctx->clazz_name_buf,  sizeof(ctx->clazz_name_buf),  info.clazz);
+    /* Method info from cache — lookup_method_info copies into these ctx-owned
+     * buffers UNDER the cache read lock (F10), so a concurrent
+     * cache_method_signature on the same slot cannot torn-overwrite the strings
+     * we hold across later vis_* sub-calls; the returned pointers refer to the
+     * ctx buffers (or NULL when absent). */
+    method_info_t info = lookup_method_info(method_id,
+        ctx->method_name_buf, sizeof(ctx->method_name_buf),
+        ctx->sig_buf,         sizeof(ctx->sig_buf),
+        ctx->clazz_name_buf,  sizeof(ctx->clazz_name_buf));
+    ctx->method_name = info.name;
+    ctx->sig         = info.sig;
+    ctx->clazz_name  = info.clazz;
     set_reentrant_call(0);
 }
 
@@ -302,17 +297,19 @@ void prepare_field_log_ctx(field_log_ctx_t *ctx, JNIEnv *env, void *receiver,
     ctx->receiver_kind = (int)classify_object(env, receiver);
     fill_object_strings(env, receiver, &ctx->receiver_str, &ctx->receiver_extra);
 
-    /* Copy every cache string into ctx-owned storage:
-     *  - field name may come from a __thread art_name_buf (TLS clobbered by the
-     *    next call on this thread)
-     *  - sig and clazz come from the rwlock-protected cache, but lookup_field_info
-     *    releases the lock before returning the raw pointers; a concurrent
-     *    cache_field_signature on the same slot strncpys in-place over the
-     *    buffers and would torn-write across our reads. */
-    field_info_t info = lookup_field_info(field_id);
-    copy_cache_str(&ctx->field_name, ctx->field_name_buf, sizeof(ctx->field_name_buf), info.name);
-    copy_cache_str(&ctx->sig,        ctx->sig_buf,        sizeof(ctx->sig_buf),        info.sig);
-    copy_cache_str(&ctx->clazz_name, ctx->clazz_name_buf, sizeof(ctx->clazz_name_buf), info.clazz);
+    /* lookup_field_info copies the cache strings into these ctx-owned buffers
+     * UNDER the cache read lock (F10) — a concurrent cache_field_signature can
+     * no longer torn-overwrite them across our reads — and the field name is
+     * resolved via ART only on a cache miss (F20), straight into field_name_buf
+     * (no shared __thread buffer). The returned pointers refer to the ctx
+     * buffers (or NULL when absent). */
+    field_info_t info = lookup_field_info(field_id,
+        ctx->field_name_buf, sizeof(ctx->field_name_buf),
+        ctx->sig_buf,        sizeof(ctx->sig_buf),
+        ctx->clazz_name_buf, sizeof(ctx->clazz_name_buf));
+    ctx->field_name = info.name;
+    ctx->sig        = info.sig;
+    ctx->clazz_name = info.clazz;
     set_reentrant_call(0);
 }
 

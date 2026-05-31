@@ -116,10 +116,24 @@ prot_region_t jni_table_region(void *table, size_t table_size);
  * ============================================================================ */
 void cache_method_signature(jmethodID method_id, const char *name,
                              const char *sig, const char *clazz);
-method_info_t lookup_method_info(jmethodID method_id);
 void cache_field_signature(jfieldID field_id, const char *name,
                             const char *sig, const char *clazz);
-field_info_t lookup_field_info(jfieldID field_id);
+
+/* lookup_*_info copy the cached strings into the CALLER's buffers while holding
+ * the cache read lock (F10), so a concurrent cache_*_signature wrlock cannot
+ * torn-overwrite a slot mid-copy.  The returned method_info_t/field_info_t
+ * pointers refer to the caller's buffers (never into the cache): each is the
+ * corresponding buffer on a hit, or NULL when that field is absent.  Buffers
+ * are always NUL-terminated.  lookup_field_info consults ART for the field name
+ * ONLY on a cache miss (F20). */
+method_info_t lookup_method_info(jmethodID method_id,
+                                 char *name_buf, size_t name_sz,
+                                 char *sig_buf, size_t sig_sz,
+                                 char *clazz_buf, size_t clazz_sz);
+field_info_t lookup_field_info(jfieldID field_id,
+                               char *name_buf, size_t name_sz,
+                               char *sig_buf, size_t sig_sz,
+                               char *clazz_buf, size_t clazz_sz);
 
 /* ============================================================================
  * Logging context — method calls

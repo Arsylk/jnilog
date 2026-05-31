@@ -409,7 +409,13 @@ pointers; the rwlock is released by the caller; a concurrent `cache_*_signature`
 buffers and `memcpy` into them under the lock, returning success/fail — never expose internal
 pointers. Removes the race entirely.
 **Acceptance:** ThreadSanitizer-style reasoning + heavy concurrent `GetMethodID`/`GetFieldID`
-device workload: names never garbled. ☐ device-tested
+device workload: names never garbled. ☑ device-tested
+**Implementation:** `lookup_method_info`/`lookup_field_info` now take caller-owned output buffers and
+`strncpy` the cached strings into them WHILE holding the rdlock, returning `info_t` pointers that
+refer to the caller buffers (never into the cache) — so a concurrent `cache_*_signature` wrlock can
+no longer torn-overwrite a slot between lookup and copy. `copy_cache_str` (and its post-lock copy
+race) is deleted; the two `hook_logging.c` callers pass their ctx buffers directly. **Device:** method
+names render coherently (`java.lang.Float::<init>(float): void`…) across 17625 lines, 0 jnilog crash.
 
 ---
 
@@ -417,7 +423,12 @@ device workload: names never garbled. ☐ device-tested
 **Where:** `hook_common.c:285-298`.
 **Fix:** acceptable as a process-lifetime cache; (a) note in a comment that two threads may both
 pay the first Go round-trip for a fresh key (loser's work discarded, not leaked); (b) optionally
-single-flight per key with a tiny "in-progress" marker. Low priority. ☐ done
+single-flight per key with a tiny "in-progress" marker. Low priority. ☑ done (option a)
+**Implementation:** added the comment at the lock-drop in `cfg_lookup` documenting that two threads
+racing the same fresh key both query Go harmlessly (the re-check lets only the first populate; the
+loser's identical result is discarded, not leaked) and that `e->owned` (strdup) is intentionally
+never freed — a process-lifetime cache bounded by `CONFIG_CACHE_SIZE`. Single-flight (option b) left
+out as not worth the complexity for a one-time-per-key race.
 
 ---
 
@@ -438,7 +449,11 @@ so the symbol is reached through a header, not the concatenated-TU `extern`-over
 result stored in `static __thread art_name_buf[128]`.
 **Fix:** only call `art_get_field_name` on cache **miss**; document the TLS-buffer "valid until
 next same-thread call" contract at the return site. Saves an ART call on the hot path.
-**Acceptance:** field-heavy workload shows no behavior change, fewer ART calls. ☐ done
+**Acceptance:** field-heavy workload shows no behavior change, fewer ART calls. ☑ done
+**Implementation:** `lookup_field_info` calls `art_get_field_name` only on a cache MISS (was every
+lookup, discarded on hit), and copies the ART name straight into the caller's name buffer — so the
+shared `__thread art_name_buf` (whose "valid until next same-thread call" lifetime was the documented
+hazard) is gone entirely. Folded into the F10 buffer-copy rewrite.
 
 ---
 
