@@ -243,11 +243,10 @@ func dispatchObjReturn(callID uint64, offset int, gref uintptr, name string) {
 		// is set, which this goroutine sets only AFTER consumerEnv is non-nil.
 		// Kept as a defensive guard — emit the pairing with a null return rather
 		// than dereferencing a nil env.
-		v, ok := pendingCalls.LoadAndDelete(callID)
+		pc, ok := pendingTake(callID)
 		if !ok {
 			return
 		}
-		pc := v.(*pendingCall)
 		emitCallFull(pc.offset, pc.frame, buildReturnValue(int(KindNull), 0, "", ""))
 		return
 	}
@@ -268,12 +267,11 @@ func dispatchObjReturn(callID uint64, offset int, gref uintptr, name string) {
 		C.free(unsafe.Pointer(cExtra))
 	}
 	result := buildReturnValue(int(cKind), gref, str, extra)
-	v, ok := pendingCalls.LoadAndDelete(callID)
+	pc, ok := pendingTake(callID)
 	if !ok {
 		emitStandaloneReturn(offset, name, result)
 		return
 	}
-	pc := v.(*pendingCall)
 	emitCallFull(pc.offset, pc.frame, result)
 }
 
@@ -415,6 +413,71 @@ func substitutePlaceholders(s string, rendered []string) string {
 	return string(out)
 }
 
+// pendingCalls backstop (F6).  Under sustained drop load the matching RETURN
+// for a stored CALL can be lost (its datagram dropped), which would otherwise
+// leave the call frame in pendingCalls forever and grow the Go heap unbounded.
+// We keep only a window of the most-recent call-ids and evict older orphans,
+// emitting each as a call-without-return (VoidValue → no "→" suffix) so the
+// call is still visible and nothing is silently dropped.
+//
+// pendingCalls and these counters are touched ONLY by the single reader
+// goroutine (dispatchCall/dispatchReturn/dispatchObjReturn) — no locking needed.
+const (
+	pendingWindow       = 4096     // keep frames within this many call-ids of the newest
+	pendingEvictTrigger = 2 * pendingWindow
+)
+
+var (
+	pendingNewest  uint64 // highest call_id stored so far
+	pendingLen     int    // live entries in pendingCalls
+	pendingEvicted uint64 // cumulative orphaned calls evicted
+)
+
+func pendingStore(callID uint64, pc *pendingCall) {
+	pendingCalls.Store(callID, pc)
+	pendingLen++
+	if callID > pendingNewest {
+		pendingNewest = callID
+	}
+	if pendingLen > pendingEvictTrigger {
+		evictStalePending()
+	}
+}
+
+// pendingTake removes and returns the frame for callID, if still present.
+func pendingTake(callID uint64) (*pendingCall, bool) {
+	v, ok := pendingCalls.LoadAndDelete(callID)
+	if !ok {
+		return nil, false
+	}
+	pendingLen--
+	return v.(*pendingCall), true
+}
+
+func evictStalePending() {
+	if pendingNewest <= pendingWindow {
+		return
+	}
+	cutoff := pendingNewest - pendingWindow
+	n := 0
+	pendingCalls.Range(func(k, v any) bool {
+		if k.(uint64) < cutoff {
+			if _, ok := pendingCalls.LoadAndDelete(k.(uint64)); ok {
+				pendingLen--
+				pendingEvicted++
+				n++
+				pc := v.(*pendingCall)
+				emitCallFull(pc.offset, pc.frame, VoidValue)
+			}
+		}
+		return true
+	})
+	if n > 0 {
+		logNativeWarn(fmt.Sprintf("event_pipe: evicted %d orphaned call frame(s) below call_id %d (%d total; matching returns likely dropped)",
+			n, cutoff, pendingEvicted))
+	}
+}
+
 func dispatchCall(callID uint64, offset int, receiverKind int, mid uintptr, strs []string) {
 	// Slot order: jni_name, receiver_str, receiver_extra, class_name,
 	//             method_name, encoded_args, caller
@@ -430,7 +493,7 @@ func dispatchCall(callID uint64, offset int, receiverKind int, mid uintptr, strs
 	}
 	receiver := decodeSingleReceiver(receiverKind, strs[1], strs[2])
 	args := decodeArgs(strs[5])
-	pendingCalls.Store(callID, &pendingCall{
+	pendingStore(callID, &pendingCall{
 		offset: offset,
 		frame: &callFrame{
 			jniName:    strs[0],
@@ -446,13 +509,12 @@ func dispatchCall(callID uint64, offset int, receiverKind int, mid uintptr, strs
 
 func dispatchReturn(callID uint64, offset int, retKind int, retRaw uintptr, strs []string) {
 	// Slot order: name, ret_str, ret_extra
-	v, ok := pendingCalls.LoadAndDelete(callID)
+	pc, ok := pendingTake(callID)
 	if !ok {
 		result := buildReturnValue(retKind, retRaw, strs[1], strs[2])
 		emitStandaloneReturn(offset, strs[0], result)
 		return
 	}
-	pc := v.(*pendingCall)
 	result := buildReturnValue(retKind, retRaw, strs[1], strs[2])
 	emitCallFull(pc.offset, pc.frame, result)
 }

@@ -121,26 +121,43 @@ const char* art_get_field_name(void* field_id) {
  * ============================================================================ */
 
 /*
- * Call/return pairing via monotonic atomic counter.
+ * Call/return pairing via a monotonic atomic counter + a per-thread call-id
+ * stack.
  *
- * Each log_jni_call increments g_call_id_counter and stashes the value in a
- * __thread slot.  log_jni_return reads the same TLS slot, so the same thread's
- * matching return picks up the exact ID without a global map or mutex.  The
- * ID is passed to both Go callbacks; the Go side uses it as a sync.Map key
- * to pair the call frame with its result for emit.
+ * log_jni_call increments g_call_id_counter and tls_push_call_id()s the value;
+ * the matching return (log_jni_return, or _log_obj_ret in hooks.c) pops it.  The
+ * id is passed to both Go-side emits, which pair the call frame with its result
+ * via a call_id-keyed map.  This replaces the old globally-locked tid→[]frame
+ * map whose mutex traffic across thousands of events/sec drove Go scheduler load.
  *
- * This replaces the old design of a globally-locked tid→[]callFrame map whose
- * mutex acquire/release pattern across thousands of JNI events per second
- * was a major source of Go scheduler activity.
- *
- * Recursion within a single thread (rare — should_log_from_caller gates
- * vis_* helper re-entry) would corrupt the TLS slot.  We don't pair
- * nested calls because the outer call's ID is overwritten; the outer
- * return then sees ID=0 and emits as unmatched.  Acceptable: this is
- * vastly less common than the typical call/return on the same thread.
+ * Why a stack, not a single TLS slot (F6): for Call*Method hooks the real app
+ * method runs *between* the call-log and the return-log, and it may itself call
+ * hooked JNI on the same thread.  A single slot would be overwritten by that
+ * nested call, so the outer return saw the wrong id (mispair) or 0 (orphan →
+ * missing/`→ null` return).  The stack pushes/pops in strict LIFO with the
+ * nesting.  push/pop stay balanced: every logged call has exactly one logged
+ * return under the same config gate.  A pop on an empty stack or beyond the
+ * depth cap returns 0 (rendered as an unpaired return) rather than corrupting.
  */
-static uint64_t            g_call_id_counter = 0;
-static __thread uint64_t   tls_last_call_id  = 0;
+static uint64_t g_call_id_counter = 0;
+
+#define TLS_CALL_ID_DEPTH 32
+static __thread uint64_t tls_call_ids[TLS_CALL_ID_DEPTH];
+static __thread int      tls_call_depth = 0;   /* logical nesting; may exceed cap */
+
+void tls_push_call_id(uint64_t id) {
+    int d = tls_call_depth++;
+    if (d >= 0 && d < TLS_CALL_ID_DEPTH) tls_call_ids[d] = id;
+    /* Beyond the cap we keep counting depth but don't store the id; the matching
+     * pop returns 0, so a pathologically deep frame simply goes unpaired. */
+}
+
+uint64_t tls_pop_call_id(void) {
+    if (tls_call_depth <= 0) { tls_call_depth = 0; return 0; }  /* empty/unbalanced */
+    int d = --tls_call_depth;
+    if (d < TLS_CALL_ID_DEPTH) return tls_call_ids[d];
+    return 0;  /* this frame was beyond the cap, never stored */
+}
 
 /* Cache goGetLoggingReady() at C-side after the first true return.  Once
  * jnilog has handed off Go-side initialization to the user, the value never
@@ -172,7 +189,7 @@ void log_jni_call(
     if (!logging_ready_fast()) return;
     if (!config_is_allowed(jni_name)) return;
     uint64_t cid = __atomic_add_fetch(&g_call_id_counter, 1, __ATOMIC_RELAXED);
-    tls_last_call_id = cid;
+    tls_push_call_id(cid);
     /* Push to the C→Go event socket — no cgo on this path. */
     event_pipe_emit_call(cid, offset, receiver_kind, mid,
                          jni_name, receiver_str, receiver_extra,
@@ -193,8 +210,7 @@ void log_jni_return(
         const char* ret_extra) {
     if (!logging_ready_fast()) return;
     if (!config_is_allowed(name)) return;
-    uint64_t cid = tls_last_call_id;
-    tls_last_call_id = 0;
+    uint64_t cid = tls_pop_call_id();
     event_pipe_emit_return(cid, offset, ret_kind, ret_raw,
                            name, ret_str, ret_extra);
 }

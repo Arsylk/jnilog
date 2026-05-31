@@ -135,6 +135,20 @@ void log_jni_return(
     const char* ret_str,
     const char* ret_extra);
 
+/* Per-thread call-id stack for call/return pairing (F6/F19).
+ *
+ * log_jni_call pushes the new call_id; the matching return (log_jni_return, or
+ * the obj-return path _log_obj_ret in hooks.c) pops it.  A stack — rather than
+ * a single TLS slot — keeps same-thread *nested* hooked JNI (an app method that
+ * itself calls hooked JNI between its call-log and return-log) from clobbering
+ * an outer frame's id and orphaning its return.  push/pop stay balanced because
+ * every logged call has exactly one logged return under the same config gate;
+ * a pop on an empty stack or beyond the depth cap returns 0 ("unpaired").  These
+ * accessors replace the old `extern __thread` reach-around into bridge.c's
+ * static slot (F19). */
+void     tls_push_call_id(uint64_t id);
+uint64_t tls_pop_call_id(void);
+
 /* log_jni_lookup_deferred — defer class_name resolution to the Go consumer.
  * Pass the LIVE jclass (or jobject) from the hook; the function NewGlobalRef's
  * it under the hood and ships the gref over the pipe.  The consumer renders

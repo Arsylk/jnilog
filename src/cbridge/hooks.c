@@ -170,36 +170,29 @@ static inline void _log_obj2_arg_call(int slot, const char *name,
  * at its native baseline.  Consumer issues the matching DeleteGlobalRef. */
 static inline void _log_obj_ret(int slot, const char *name,
                                  JNIEnv *env, void *obj) {
-    if (!obj) {
-        log_jni_return(slot, name, WIRE_KIND_NULL, 0, "", "");
-        return;
+    /* Defer object rendering only when there's a real object, a consumer is
+     * attached to render + free the gref (F1), and the method passes the config
+     * gate (so the pop below stays balanced with log_jni_call's push — same name
+     * → same gate).  Otherwise fall through to the normal return path. */
+    if (obj && event_pipe_consumer_ready() && config_is_allowed(name)) {
+        /* NewGlobalRef: one JNI call, much cheaper than 4-5 vis_* JNI calls. */
+        void *gref = (void*)(*env)->NewGlobalRef(env, obj);
+        if (gref) {
+            uint64_t cid = tls_pop_call_id();   /* the single pop on this path */
+            extern int event_pipe_emit_obj_return(uint64_t, int32_t, uintptr_t, const char*);
+            if (event_pipe_emit_obj_return(cid, slot, (uintptr_t)gref, name ? name : "") != 0) {
+                /* Datagram dropped — the consumer will never see (or free) this
+                 * gref, so release it here (F1). */
+                (*env)->DeleteGlobalRef(env, gref);
+            }
+            return;
+        }
+        /* OOM in the global-ref table — fall through to the void-return path. */
     }
-    /* Defer object rendering only when a consumer is attached to render + free
-     * the gref; otherwise emit a void-shaped return (no gref minted) so we never
-     * leak a ref the consumer will never drain (F1). */
-    if (!event_pipe_consumer_ready()) {
-        log_jni_return(slot, name, WIRE_KIND_NULL, 0, "", "");
-        return;
-    }
-    /* NewGlobalRef: one JNI call, much cheaper than 4-5 vis_* JNI calls. */
-    void *gref = (void*)(*env)->NewGlobalRef(env, obj);
-    if (!gref) {
-        /* OOM in the global ref table — fall back to a void return so the
-         * call frame still gets emitted, just without the return payload. */
-        log_jni_return(slot, name, WIRE_KIND_NULL, 0, "", "");
-        return;
-    }
-    /* Pair with the matching call_id via the same TLS slot log_jni_return
-     * normally uses — Go side consumes call_id from event header. */
-    extern __thread uint64_t tls_last_call_id;
-    extern int event_pipe_emit_obj_return(uint64_t, int32_t, uintptr_t, const char*);
-    uint64_t cid = tls_last_call_id;
-    tls_last_call_id = 0;
-    if (event_pipe_emit_obj_return(cid, slot, (uintptr_t)gref, name ? name : "") != 0) {
-        /* Datagram dropped — the consumer will never see (or free) this gref,
-         * so release it here. */
-        (*env)->DeleteGlobalRef(env, gref);
-    }
+    /* null / no-consumer / filtered / OOM: emit a void-shaped return via the
+     * normal path, which applies the same ready+config gate and pops the
+     * call-id stack itself — so exactly one pop happens per _log_obj_ret. */
+    log_jni_return(slot, name, WIRE_KIND_NULL, 0, "", "");
 }
 #define LOG_OBJ_RET(Env, Slot, Name, Obj) do { \
     set_reentrant_call(1); \

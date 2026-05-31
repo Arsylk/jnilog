@@ -234,7 +234,20 @@ is now safe by construction; not needed yet).
 
 **Acceptance:** recursion-heavy workload (e.g. `toString()` chains) over ≥10 min: `pendingCalls`
 size bounded (add a debug expvar/log), output still pairs correctly for the common case.
-☐ host-tested · ☐ device-tested
+☑ host-tested · ☑ device-tested
+**Implementation:** replaced the single-slot `tls_last_call_id` with a per-thread call-id **stack**
+(`tls_push_call_id`/`tls_pop_call_id`, depth cap 32) defined in `bridge.c`, declared in `bridge.h`
+(F19 — eliminates the `extern __thread` reach-around). `log_jni_call` pushes; `log_jni_return` and
+`_log_obj_ret` pop. Pushes/pops stay balanced via the same `config_is_allowed` gate on call and
+return; a pop on an empty stack / past the cap returns 0 (unpaired) rather than corrupting.
+`_log_obj_ret` reworked so exactly one pop happens per return. Go backstop: `pendingStore`/
+`pendingTake` track a live count, and `evictStalePending` evicts call frames older than
+`newest − 4096` once the map exceeds 8192, emitting each as a call-without-return (`VoidValue`) and
+logging an eviction counter — bounding the Go heap when returns are dropped.
+**Device (chatgpt, 19507-line nested-JNI-heavy init):** pairing coherent — `java.io.File::length() → 0L`,
+`String::lastIndexOf(33) → 98` pair receiver+method+return correctly; 0 malformed/bad-magic events,
+0 jnilog crash, 4397 drops handled with no `pendingCalls` blowup. (Eviction path stayed naturally
+untriggered under tested load; a host unit test for it is folded into F5/Phase 5.)
 
 ---
 
@@ -364,7 +377,9 @@ single-flight per key with a tiny "in-progress" marker. Low priority. ☐ done
 **Fix:** when implementing the F6 call-id **stack**, define it once in a shared header with a
 proper accessor API (`tls_push_call_id`, `tls_pop_call_id`) — eliminates the static/extern hack.
 **Acceptance:** compiles without relying on TU concat for this symbol; F6 stack lives here.
-☐ done (folded into F6)
+☑ done (folded into F6) — `tls_push_call_id`/`tls_pop_call_id` now live in `bridge.h`/`bridge.c`
+with a real accessor API; hooks.c no longer redeclares `extern __thread uint64_t tls_last_call_id`,
+so the symbol is reached through a header, not the concatenated-TU `extern`-over-`static` hack.
 
 ---
 
