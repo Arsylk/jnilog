@@ -395,9 +395,12 @@ static int is_self_symbol(const char* name, void* sym) {
 static uintptr_t maps_find_lib_base(const char* lib_suffix) {
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f) return 0;
-    char line[512];
+    /* getline so a long split-APK path isn't truncated at 512 B, which could
+     * hide the matching lib's line and make us miss its base (F12). */
+    char* line = NULL;
+    size_t line_cap = 0;
     uintptr_t base = 0;
-    while (fgets(line, sizeof(line), f)) {
+    while (getline(&line, &line_cap, f) != -1) {
         char* path = strrchr(line, '/');
         if (!path) continue;
         char* nl = path + strlen(path) - 1;
@@ -409,6 +412,7 @@ static uintptr_t maps_find_lib_base(const char* lib_suffix) {
         base = (uintptr_t)lo;
         break;
     }
+    free(line);
     fclose(f);
     return base;
 }

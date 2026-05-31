@@ -42,7 +42,10 @@ static pthread_mutex_t g_range_pkg_lock = PTHREAD_MUTEX_INITIALIZER;
  * it.  Prevents hot-path retry storms: once we've attempted seeding and found
  * nothing, we don't retry on every JNI call.  Reset when something changes
  * (new library loaded via dlopen, package name set). */
-static volatile int g_seed_attempted = 0;
+/* Accessed with __atomic_* (ACQUIRE/RELEASE) rather than `volatile` (F14) — to
+ * match the g_exec_range_count discipline elsewhere in this file; volatile gives
+ * no cross-thread ordering or atomicity guarantee. Zero-initialised as a static. */
+static int g_seed_attempted;
 
 /* PID that last seeded.  A mismatch means we've forked: the inherited package
  * name + exec ranges belong to the parent (e.g. zygote), so they get dropped
@@ -68,7 +71,7 @@ void c_set_package_name(const char *name) {
 
   /* Reset the seed-attempted flag so the hot path will re-attempt seeding
    * now that we have a valid package name. */
-  g_seed_attempted = 0;
+  __atomic_store_n(&g_seed_attempted, 0, __ATOMIC_RELEASE);
 }
 
 /* Strictly speaking the package-name buffer can be rewritten more than once
@@ -302,14 +305,14 @@ int c_has_exec_ranges(void) {
  * from calling c_seed_exec_ranges_from_maps() on every JNI hook. */
 int c_should_try_seed(void) {
   if (__atomic_load_n(&g_exec_range_count, __ATOMIC_ACQUIRE) > 0) return 0;
-  if (g_seed_attempted) return 0;
+  if (__atomic_load_n(&g_seed_attempted, __ATOMIC_ACQUIRE)) return 0;
   return 1;
 }
 
 /* Reset the seed-attempted flag so the next should_log_from_caller will
  * re-attempt seeding.  Called when something changes (dlopen, package name). */
 void c_reset_seed_attempted(void) {
-  g_seed_attempted = 0;
+  __atomic_store_n(&g_seed_attempted, 0, __ATOMIC_RELEASE);
 }
 
 /* ====================================================================
@@ -394,7 +397,7 @@ int c_seed_exec_ranges_from_maps(void) {
       pthread_mutex_lock(&g_range_pkg_lock);
       g_range_package_name[0] = '\0';
       pthread_mutex_unlock(&g_range_pkg_lock);
-      g_seed_attempted = 0;
+      __atomic_store_n(&g_seed_attempted, 0, __ATOMIC_RELEASE);
     }
     __atomic_store_n(&g_seed_pid, me, __ATOMIC_RELEASE);
   }
@@ -455,7 +458,7 @@ int c_seed_exec_ranges_from_maps(void) {
 
   /* Mark that we've attempted seeding.  If we found nothing, the hot path
    * won't retry until something resets this flag (dlopen, set_package_name). */
-  g_seed_attempted = 1;
+  __atomic_store_n(&g_seed_attempted, 1, __ATOMIC_RELEASE);
 
   return added;
 }
@@ -482,9 +485,13 @@ static int c_seed_exec_ranges_from_proc_maps(void) {
   if (!f) return 0;
 
   int added = 0;
-  char line[512];
+  /* getline grows `line` to fit the whole entry, so a long split-APK path
+   * (/data/app/~~base64==/pkg==/lib/arm64/libfoo.so [ (deleted)]) is no longer
+   * truncated at 512 B — which used to silently drop that lib from seeding (F12). */
+  char *line = NULL;
+  size_t line_cap = 0;
 
-  while (fgets(line, sizeof(line), f)) {
+  while (getline(&line, &line_cap, f) != -1) {
     /* Parse: start-end perms offset dev inode pathname */
     uintptr_t start, end;
     char perms[5];
@@ -550,6 +557,7 @@ static int c_seed_exec_ranges_from_proc_maps(void) {
     }
   }
 
+  free(line);
   fclose(f);
   return added;
 }

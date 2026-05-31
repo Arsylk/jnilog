@@ -482,7 +482,16 @@ reuse fails the build instead of silently capturing 4 of 8 bytes.
 Long `/data/app/~~base64==/pkg==/lib/arm64/libfoo.so (deleted)` paths can exceed 511 → currently
 the lib is silently dropped from seeding.
 **Acceptance:** an app with a deeply-nested split-APK lib path is correctly range-seeded (its JNI
-calls are logged). ☐ device-tested
+calls are logged). ☑ implemented · ☑ no-regression-tested
+**Implementation:** both maps-parsing loops (`maps_find_lib_base` in `main.c`,
+`c_seed_exec_ranges_from_proc_maps` in `rangeset.c`) switched from `char line[512]` + `fgets` to
+`getline()`, which grows the buffer to the full line — so a long `/data/app/~~b64==/pkg==/lib/...so
+[ (deleted)]` path is no longer truncated at 511 B and dropped. `page_prot_from_maps` (F3) keeps a
+512-byte buffer since it reads only the leading `lo-hi perms` fields.
+**Device:** chatgpt seeds + attributes both `libpairipcore.so` (16526 events, a split-APK path) and
+`liblkjingle_peerconnection_so.so` (1023) correctly — getline parse is regression-clean. (A path
+>511 B isn't present on the test target, so the long-path benefit is validated by construction +
+no-regression rather than a positive device repro.)
 
 ---
 
@@ -493,19 +502,39 @@ calls are logged). ☐ device-tested
 track via the `mprotect(PROT_EXEC)` hook even with no name) so PairIP/packed code running from
 anonymous maps isn't misclassified as non-app and dropped.
 **Acceptance:** capture from a packed app (jiagu/PairIP) shows JNI calls originating from
-anonymous exec regions. ☐ device-tested
+anonymous exec regions. ⊘ won't-fix (deferred, justified)
+**Justification:** every candidate implementation range-adds anonymous executable regions, which on
+this device would also capture ART's JIT code-cache and executable-allocator regions — making
+`should_log_from_caller` return true for callers there and flooding the log with non-app events on
+EVERY app, a clear regression against the no-regression gate. The naive `path[0] != '/'` inclusion
+and the "add anon via the mprotect hook" variant both have this hazard, and neither can be safely
+distinguished from app/packer code without an app-vs-ART origin discriminator. Crucially the
+motivating scenario is **not reproducible on the available device**: the proven target's protector
+(`libpairipcore.so`) runs **file-backed**, not from anonymous maps (all 16526 of its events are
+already captured), and no confirmed jiagu/anon-map-packer app is installed to validate against. So
+implementing F13 now would risk degrading every capture to fix a latent issue that can't be
+exercised. **Revisit** with: (a) a jiagu-packed test app, and (b) a heuristic that admits app-origin
+anon-exec while excluding `[anon:dalvik-*]` / ART code-cache regions.
 
 ---
 
 ### F14 — `g_seed_attempted` is `volatile` not atomic  🟡 LOW
 **Where:** `rangeset.c:44`, read `:285`, written `:62/:292/:417`.
 **Fix:** convert to `__atomic_load_n/__atomic_store_n` with ACQUIRE/RELEASE to match the
-`g_exec_range_count` discipline used elsewhere in the file. ☐ done
+`g_exec_range_count` discipline used elsewhere in the file. ☑ done
+**Implementation:** `g_seed_attempted` is now a plain `int` accessed via `__atomic_load_n`(ACQUIRE)
+at the `c_should_try_seed` read and `__atomic_store_n`(RELEASE) at all writes (`c_set_package_name`,
+`c_reset_seed_attempted`, the post-seed mark, and the F2 PID-change reset). Build clean, host green.
 
 > Consider also (perf, not a bug): `c_is_in_exec_range` is an O(n) linear scan under a mutex on
 > the hot path (`rangeset.c:249-272`). If profiling shows contention, switch to a sorted array +
 > binary search or a seqlock (write-rare/read-frequent). Track separately — not required for
-> "no known defects," but state-of-the-art. ☐ evaluated
+> "no known defects," but state-of-the-art. ☑ evaluated — kept as-is.
+> In practice the range set holds a handful of entries (a few app libs; 16526-event chatgpt runs
+> showed no observable contention or latency spike), the scan is bounded by MAX_EXEC_RANGES (1024)
+> under a briefly-held mutex, and writes are rare (seed + dlopen). A sorted-array/seqlock rewrite
+> would add complexity for no measured benefit; revisit only if profiling on a many-lib target shows
+> contention. Not a defect.
 
 ---
 
