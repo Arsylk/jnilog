@@ -381,15 +381,6 @@ static jint hooked_vm_GetEnv(JavaVM* vm, void** penv, jint version);
 JNIEXPORT jint JNICALL JNI_GetCreatedJavaVMs(JavaVM** p_vm, jsize buf_len, jsize* n_vms);
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved);
 
-static int is_self_symbol(const char* name, void* sym) {
-    if (!sym) return 0;
-    if (strcmp(name, "JNI_GetCreatedJavaVMs") == 0 && sym == (void*)JNI_GetCreatedJavaVMs) return 1;
-    if (strcmp(name, "JNI_OnLoad") == 0 && sym == (void*)JNI_OnLoad) return 1;
-    if (strcmp(name, "android_dlopen_ext") == 0 && sym == (void*)android_dlopen_ext) return 1;
-    if (strcmp(name, "mprotect") == 0 && sym == (void*)mprotect) return 1;
-    return 0;
-}
-
 /* --- Helpers --- */
 
 static uintptr_t maps_find_lib_base(const char* lib_suffix) {

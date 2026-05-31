@@ -57,7 +57,8 @@ available.
 │  logger.go       Colorized formatter, all emit_* functions   │
 │  value.go        JNIValue, decodeArgs, buildReturnValue      │
 │  config.go       JSON config, cgo exports, call-key builder  │
-│  main.go         Cgo callbacks, callFrame stack              │
+│  event_pipe.go   AF_UNIX socket reader, call_id pairing      │
+│  main.go         event-pipe bootstrap, logcat sink, bridge   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -66,11 +67,11 @@ available.
 1. **Hook entry** → checks `should_log_from_caller` (is caller from a tracked library?)  
 2. **Config gate** → checks whitelist/blacklist (cached O(1) lookup, cgo crossing only once per function name)  
 3. **Arg extraction** → `extract_va_args` pulls typed args from `va_list`  
-4. **Wire encoding** → `vis_encode_typed_args` produces `sigChar\x01value\x02` records  
-5. **Go callback** → `goJNICallCallback` builds `callFrame`, pushes to per-thread stack  
+4. **Wire encoding** → `vis_encode_typed_args` produces `sigChar\x01value\x02` records (control bytes in string content are escaped)  
+5. **Event emit** → `log_jni_call` packs the record + a monotonic `call_id` and `send()`s it over an AF_UNIX `SOCK_DGRAM` socket — **no cgo on the hot path**; the `call_id` is pushed on a per-thread stack so nested calls pair correctly  
 6. **Call execution** → original JNI function runs  
-7. **Return encoding** → `log_method_return_value` resolves the typed return value  
-8. **Go render** → `emitCallFull` pops frame, checks Gate 3 (regex blacklist), formats and writes  
+7. **Return encoding** → `log_method_return_value` resolves the typed return value and emits a return record carrying the popped `call_id`  
+8. **Go reader** → a goroutine drains the socket, builds a `callFrame` into `pendingCalls` keyed by `call_id` on the CALL record, and on the matching RETURN record pairs them (`LoadAndDelete`) → `emitCallFull` checks Gate 3 (regex blacklist), formats and writes  
 
 ---
 
@@ -83,7 +84,7 @@ available.
 | **Lookups** | 5 | `FindClass`, `GetMethodID`, `GetStaticMethodID`, `GetFieldID`, `GetStaticFieldID` |
 | **Register** | 2 | `RegisterNatives`, `UnregisterNatives` |
 | **References** | 9 | `New/Delete{Global,Local,WeakGlobal}Ref`, `IsSameObject`, `Push/PopLocalFrame` |
-| **Strings** | 10 | `{New,Get,Release}{String,StringUTF}{Chars,}`, `GetString{UTF,}{Length,Region}` |
+| **Strings** | 12 | `{New,Get,Release}{String,StringUTF}{Chars,}`, `GetString{UTF,}{Length,Region}` |
 | **Arrays — primitive** | 40 | `New*Array`, `Get/Release*ArrayElements`, `Get/Set*ArrayRegion` — all 8 types |
 | **Arrays — object** | 4 | `NewObjectArray`, `Get/SetObjectArrayElement`, `GetArrayLength` |
 | **Critical sections** | 4 | `Get/ReleasePrimitiveArrayCritical`, `Get/ReleaseStringCritical` |
@@ -196,7 +197,7 @@ Place a JSON file at `/data/local/tmp/jnilog.json` (or set `JNILOG_CONFIG` env v
 | `fields` | 36 | All `Get/Set*Field`, `Get/SetStatic*Field` |
 | `exceptions` | 7 | `Throw`, `ThrowNew`, `Exception*`, `FatalError` |
 | `arrays` | 44 | All `New*Array`, `Get/Set/Release*Array*`, `GetArrayLength`, `SetObjectArrayElement` |
-| `strings` | 10 | All `*String*` operations |
+| `strings` | 12 | All `*String*` operations |
 | `refs` | 10 | All `*GlobalRef`, `*LocalRef`, `IsSameObject`, `Push/PopLocalFrame`, `EnsureLocalCapacity` |
 | `lookups` | 5 | `FindClass`, `GetMethodID`, `GetStaticMethodID`, `GetFieldID`, `GetStaticFieldID` |
 
@@ -377,11 +378,13 @@ jnilog/
 │   │   ├── visualize.c/.h         # JNI object introspection + typed-arg wire encoding
 │   │   └── rangeset.c             # dl_iterate_phdr-based caller-range filter
 │   └── go/                        # Go layer (rendering, config, types)
-│       ├── main.go                # Cgo callbacks, callFrame stack, bridge init
+│       ├── main.go                # event-pipe bootstrap, logcat sink, bridge init
 │       ├── init.go                # Process init, package-name resolution
+│       ├── event_pipe.go          # AF_UNIX socket reader, call_id pairing, drop monitor
 │       ├── logger.go              # Colorized formatter, all emit_* functions
 │       ├── value.go               # JNIValue type system, decodeArgs, buildReturnValue
 │       ├── config.go              # JSON config parsing, cgo exports, call-key builder
+│       ├── gate_shared.go         # shared gate impl (cgo export + host test)
 │       ├── signature.go           # JNI signature parser
 │       ├── rangeset.go            # Thin Go wrappers for C rangeset
 │       ├── visualize.go           # Thin Go wrappers for C visualize functions
@@ -414,8 +417,8 @@ Three X-macro type lists (`JNI_PRIMITIVE_ARRAY_TYPES`, `JNI_FIELD_TYPES`, `JNI_I
 ### Reentrancy via TLS flag
 Hooks call JNI to resolve object types for display (e.g. `toString()` on return values).  Without protection, these JNI calls would re-enter our own hooks → infinite recursion.  A thread-local `g_in_hook` flag short-circuits reentrant calls directly to the original JNI table.
 
-### Per-thread callFrame stack
-Nested JNI calls (e.g. `toString()` called by `vis_object_tostring` inside a `CallObjectMethod` hook) are tracked via a per-thread FIFO stack in Go.  Each `log_jni_call` pushes a frame, each `log_jni_return` pops it.  Return values are matched to the correct call site.
+### call_id pairing across the event socket
+Each `log_jni_call` stamps the event with a monotonic `call_id` and pushes it on a **per-thread LIFO call-id stack** (in `bridge.c`); the matching `log_jni_return` pops it, so a nested hooked call (e.g. an app method that itself calls hooked JNI between a call and its return) cannot clobber the outer frame's id.  The id rides the wire record; the Go reader stores the CALL in a `pendingCalls` map keyed by `call_id` and pairs the RETURN to it (`LoadAndDelete`).  Orphaned calls (a RETURN dropped under load) are evicted as call-without-return so the map stays bounded.
 
 ### Multi-sink logging
 Lines are written to both `logcat` (`ANDROID_LOG_INFO`) and `stdout`.  `NO_COLOR=1` environment variable disables ANSI escapes for plain-text output.

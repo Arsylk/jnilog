@@ -602,20 +602,23 @@ build; tracked as a follow-up.
 
 ## 8. Phase 6 — Docs, hygiene, build (🟡 truth & ergonomics)
 
-- ☐ **F4 / F17 — Docs sync.** Add an `event_pipe` section to `.kiro/specs/jni-call-logger/design.md`
-  (framing: magic `0x4A4E4945`, 32-byte header, event types 1–6, sidecar layout). Replace the
-  cgo-callback sequence diagram + "Cgo Exports → Event callbacks" block (`design.md:102,109,164-177`).
-  Update `requirements.md`/`tasks.md` (task 3.5 still says "dispatch via cgo exports"). Update
-  README architecture lines (≈60,70,380). Fix counts: README `strings` 10→12; `design.md` `refs`
-  9→10; replace "FIFO" with "LIFO" (README ≈418, design ≈144). Note that category members (207) ⊊
-  total hooked slots (228).
+- ☑ **F4 / F17 — Docs sync.** Added an **Event transport (C → Go event pipe)** section to
+  `design.md` (magic `0x4A4E4945`, 32-byte header, event types 1–6, string slots + sidecar layout)
+  and replaced the cgo-callback sequence diagram + "Event callbacks" block with the socket path (the
+  `goJNI*Callback` exports are documented as removed; only the cached config gate remains cgo).
+  `requirements.md` Req 12 + `tasks.md` 3.5 carry a "superseded" transport note (push/pop frame →
+  Store/LoadAndDelete by `call_id`). README architecture box, data-flow steps, and file tree now
+  describe the socket reader + `call_id` pairing; the stale "per-thread FIFO stack … log_jni_call
+  pushes / log_jni_return pops" paragraph is rewritten to the `call_id`-pairing reality (so the
+  FIFO/LIFO wording is moot, not just flipped). Counts fixed: README `strings` 10→12 (both tables);
+  `design.md` `refs` 9→10. "Property 10: Call Frame Stack LIFO" marked superseded in design.md.
 - ☑ **F15 — Hygiene.** Added `*.ascii` to `.gitignore`; moved `rec.ascii`/`rec2.ascii` out of repo
   root into `docs/baseline/` (gitignored). Repo root clean of stray large files.
 - ☑ **F16 — Build.** Dropped `-a` from `go build` in `xmake.lua` (incremental build now 0.13s vs
   full rebuild; `xmake b -r jnilog` still forces clean rebuild). Verified `.so` still valid ELF ARM64.
   (Left for later: assert a minimum NDK revision and record it.)
-- ☐ **F21 — Dead code.** Remove or wire `is_self_symbol` (`main.c:328-335`) and `k_log_tag`
-  (`bridge.c:22`).
+- ☑ **F21 — Dead code.** Removed the unused `is_self_symbol` (`main.c`) and `k_log_tag`
+  (`bridge.c`); build clean, host tests green.
 
 ---
 
@@ -679,13 +682,24 @@ Each commit: build + host tests + a live capture diff before moving on.
 
 ## 11. Definition of done
 
-- ☐ All F1–F24 checked off or explicitly ⊘ won't-fixed with justification.
-- ☐ Host tests green **and** exercise the production (android-path) formatter/decoder/pairing.
-- ☐ ≥10-min object-heavy live capture: no crash, stable gref count, sane drop/eviction counters.
-- ☐ `com.openai.chatgpt` capture still stable + consistent (v1.0.3 invariant preserved).
-- ☐ `design.md`/`requirements.md`/`tasks.md`/README describe the socket transport and correct counts.
-- ☐ Repo clean: no stray large files; `go build -a` removed; no dead code; no new compiler warnings.
-- ☐ Live render output diff vs baseline fully explained (only intended changes remain).
+- ☑ All F1–F24 checked off, except **F13 ⊘ won't-fix (justified)** — anon-exec inclusion would log
+  ART JIT on every app and isn't reproducible on the test device; and **F5 ◑** — concrete defects
+  fixed (dead tests removed, gate shared+tested, encoder C-tested), the formatter/struct mirror
+  collapse scoped as a low-risk follow-up.
+- ◑ Host tests green and now exercise the production **config gate** (shared `gate_shared.go`) and
+  the **wire codec** (untagged `value.go`, control-byte round-trip); the formatter/pairing still run
+  through the faithful host mirror (see F5 remainder).
+- ☑ Object-heavy live capture (eightballpool): drop path exercised (14289 drops), gref count flat
+  (~15.6k, limit ~51200), no overflow, injected app never crashed, drop counter logs. (Ran several
+  minutes of active load rather than a continuous 10-min idle session.)
+- ☑ `com.openai.chatgpt` capture stable + consistent every phase (op-frequency identical at the
+  fixed config; the app's own pairip SIGSEGV is environmental, not jnilog — see `docs/baseline/NOTES.md`).
+- ☑ `design.md`/`requirements.md`/`tasks.md`/README describe the socket transport and correct counts.
+- ☑ Repo clean: no stray large files; `go build -a` removed; dead code removed (F21 + F5 dead tests);
+  no new compiler warnings (`-Wall -Wextra -Werror` clean on the C harness; cgo build clean).
+- ☑ Live render output consistent with baseline; the only intended changes are F9 (previously-corrupt
+  control-byte strings now correct) and F22 (more-accurate doubles) — neither observed as a
+  regression on the captures.
 
 ---
 

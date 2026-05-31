@@ -19,7 +19,6 @@
 #include "event_pipe.h"
 #include "_cgo_export.h"
 
-static const char* k_log_tag = "JNILogPayload";
 /* One-shot Go-bridge activation.  Fork note (F2): like any pthread_once /
  * static, this is COW-inherited across fork() and would skip in a child — but
  * deliberately so.  goBridgeInit drives the embedded Go runtime, which does NOT
