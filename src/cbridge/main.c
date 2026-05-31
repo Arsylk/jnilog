@@ -51,6 +51,7 @@ static const char* sanitize_for_log(char* dst, size_t dstsize, const char* src) 
 
 /* Global state */
 static int g_initialized = 0;
+static pid_t g_init_pid = 0;   /* PID that ran init; detects a forked child (F2) */
 static int g_injection_mode = 0;
 static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -414,12 +415,20 @@ static void* elf_find_sym(uintptr_t base, const char* sym_name) {
 /* --- Init --- */
 
 static void init_once_handler(void) {
-    /* g_initialized is process-local — resets to 0 after fork(),
-     * so each new child process correctly re-initializes.
-     * pthread_once would survive fork and skip init in children. */
+    /* Fork-safety (F2): a `static g_initialized` is NOT reset by fork() — the
+     * child gets a COW copy with the SAME value, identical to the pthread_once
+     * case.  So we PID-stamp instead of trusting the flag: re-init iff we are
+     * the same process that set it.  In the gozinject model this runs exactly
+     * once anyway — gozinject traps setArgV0 and injects into the already-forked,
+     * specialized app child, so there is no fork after the constructor runs.
+     * The PID guard is a latent-landmine guard for any future zygote-resident
+     * model; per-process *identity* (package name + exec ranges) is re-resolved
+     * on PID change inside rangeset's c_seed_exec_ranges_from_maps. */
     pthread_mutex_lock(&g_init_lock);
-    if (g_initialized) { pthread_mutex_unlock(&g_init_lock); return; }
+    pid_t me = getpid();
+    if (g_initialized && g_init_pid == me) { pthread_mutex_unlock(&g_init_lock); return; }
     g_initialized = 1;
+    g_init_pid = me;
     pthread_mutex_unlock(&g_init_lock);
 
     LOG_DIRECT(ANDROID_LOG_INFO, "init_once_handler: starting pid=%d", getpid());

@@ -20,6 +20,15 @@
 #include "_cgo_export.h"
 
 static const char* k_log_tag = "JNILogPayload";
+/* One-shot Go-bridge activation.  Fork note (F2): like any pthread_once /
+ * static, this is COW-inherited across fork() and would skip in a child — but
+ * deliberately so.  goBridgeInit drives the embedded Go runtime, which does NOT
+ * survive a raw fork (only the forking thread continues; the reader goroutine,
+ * scheduler, etc. are gone), so re-running it in a fork child would crash, not
+ * help.  In the gozinject model the .so is dlopen'd fresh in the already-forked,
+ * specialized child, so this is genuinely first-run there.  Per-process identity
+ * that CAN be re-resolved without the Go runtime (package name + exec ranges) is
+ * handled PID-aware on the C side in rangeset (c_seed_exec_ranges_from_maps). */
 static pthread_once_t g_go_bridge_once = PTHREAD_ONCE_INIT;
 
 /* ── Native logging (pre-Go-init safe) ───────────────────────────────────── */

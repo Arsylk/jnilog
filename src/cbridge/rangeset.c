@@ -18,6 +18,7 @@
 #include <dlfcn.h>
 #include <link.h>
 #include <elf.h>
+#include <unistd.h>
 
 #if __has_include(<android/log.h>)
 #include <android/log.h>
@@ -42,6 +43,14 @@ static pthread_mutex_t g_range_pkg_lock = PTHREAD_MUTEX_INITIALIZER;
  * nothing, we don't retry on every JNI call.  Reset when something changes
  * (new library loaded via dlopen, package name set). */
 static volatile int g_seed_attempted = 0;
+
+/* PID that last seeded.  A mismatch means we've forked: the inherited package
+ * name + exec ranges belong to the parent (e.g. zygote), so they get dropped
+ * and re-resolved for this process (F2).  The primary gozinject model injects
+ * into the already-forked, specialized app child (it traps setArgV0 *after*
+ * fork), so there is no fork after our load and this never triggers there — it
+ * is a latent-landmine guard for any future zygote-resident model. */
+static pid_t g_seed_pid = 0;
 
 void c_set_package_name(const char *name) {
   pthread_mutex_lock(&g_range_pkg_lock);
@@ -246,6 +255,17 @@ int c_add_exec_range(uintptr_t base, uintptr_t size) {
   return 0;
 }
 
+/* Drop all seeded ranges.  Used on a detected fork — the inherited ranges
+ * belong to the parent process and must be re-seeded for the child (F2). */
+static void c_clear_exec_ranges(void) {
+  pthread_mutex_lock(&g_range_lock);
+  /* Release-store paired with the acquire-loads in c_has_exec_ranges /
+   * c_should_try_seed so a concurrent reader never sees count==0 with stale
+   * entries (it would just re-seed, which is safe). */
+  __atomic_store_n(&g_exec_range_count, 0, __ATOMIC_RELEASE);
+  pthread_mutex_unlock(&g_range_lock);
+}
+
 int c_is_in_exec_range(uintptr_t addr) {
   if (addr == 0)
     return 0;
@@ -358,6 +378,27 @@ static int seed_iter_cb(struct dl_phdr_info *info, size_t size, void *data) {
 }
 
 int c_seed_exec_ranges_from_maps(void) {
+  /* Fork detection (F2): if we're a *different* process than the one that last
+   * seeded (a non-zero prior PID that isn't ours), the inherited package name +
+   * exec ranges are the parent's — drop them so the refresh + maps walk below
+   * re-establish OUR identity.  On the very first seed (prior PID 0) we only
+   * record our PID and clear NOTHING, so the package name goBridgeInit just set
+   * is preserved (re-resolving it would be fragile under stealth soinfo
+   * unlinking).  Cheap (cached getpid()), off the hot path (runs on dlopen /
+   * first-seed, not per JNI event). */
+  pid_t me = getpid();
+  pid_t prev = __atomic_load_n(&g_seed_pid, __ATOMIC_ACQUIRE);
+  if (prev != me) {
+    if (prev != 0) {
+      c_clear_exec_ranges();
+      pthread_mutex_lock(&g_range_pkg_lock);
+      g_range_package_name[0] = '\0';
+      pthread_mutex_unlock(&g_range_pkg_lock);
+      g_seed_attempted = 0;
+    }
+    __atomic_store_n(&g_seed_pid, me, __ATOMIC_RELEASE);
+  }
+
   /* Refresh the package name first — the process may have been specialized
    * (renamed from zygote64 to com.termux) since the last attempt. */
   refresh_package_name_if_needed();

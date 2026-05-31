@@ -282,7 +282,21 @@ pthread_mutex_unlock(&g_init_lock);
   document the actual Android model: zygote specialization vs gozinject single-process).
 
 **Acceptance:** force a forking scenario (or zygote injection) and confirm the child logs its
-**own** package name and re-seeded ranges, not zygote's. ☐ device-tested
+**own** package name and re-seeded ranges, not zygote's. ◑ implemented · ☑ no-regression-tested · ⊘ fork-path not device-reachable
+**Implementation:** main.c PID-stamps `init_once_handler` (`g_init_pid`) and the false "static resets
+on fork" comment is replaced with the real mechanism. rangeset is PID-aware: `c_seed_exec_ranges_from_maps`
+detects a changed PID and drops the inherited package name + exec ranges (`c_clear_exec_ranges`) so the
+child re-resolves its own identity — but ONLY on a real fork (a prior non-zero PID), so the first seed
+preserves the package name `goBridgeInit` just set. bridge.c and init.go comments now document the
+truth: the embedded Go runtime does NOT survive a raw fork, so neither the C `pthread_once` nor the Go
+`sync.Once` re-runs `goBridgeInit` in a child (it would crash, not help); C-side rangeset handles the
+identity that can be re-resolved without the runtime.
+**Why ⊘ on the fork acceptance:** gozinject traps `setArgV0` and injects into the *already-forked,
+specialized* app child — there is no fork after our load — so a forking scenario is not reachable in
+the primary model. The fix is a latent-landmine guard validated by code-correctness + no-regression.
+**Device (chatgpt):** 15868 lines, package resolved to `com.openai.chatgpt`, rangeset caller-filtering
+intact (full pairip output), 0 stray markers, 0 jnilog crash — the PID guard does not perturb the
+single-process path.
 
 ---
 

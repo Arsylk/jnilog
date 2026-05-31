@@ -42,8 +42,17 @@ func goInitOnce() {
 }
 
 // goBridgeInit is called from C's bridge_activate_go() via pthread_once.
-// We additionally guard with sync.Once on the Go side so that the Go runtime's
-// fresh state after fork() correctly re-initializes (requirement 15.5).
+//
+// Fork model (F2): the embedded Go runtime does NOT survive a raw fork() — only
+// the forking thread continues in the child, so the scheduler, this reader, and
+// every other goroutine are gone.  Re-running goBridgeInit in such a child would
+// crash, not recover, so neither the C pthread_once nor this sync.Once attempts
+// to.  In the gozinject model that is moot: gozinject traps setArgV0 and dlopens
+// the payload into the already-forked, *specialized* app child, so the Go
+// runtime is created fresh in that process and goBridgeInit runs exactly once
+// there.  Per-process identity that does not need the Go runtime — package name
+// and exec-range seeding — is re-resolved PID-aware on the C side (rangeset's
+// c_seed_exec_ranges_from_maps), which is what a forked child actually needs.
 //
 //export goBridgeInit
 func goBridgeInit() {
