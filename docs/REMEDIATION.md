@@ -355,7 +355,16 @@ pointer also sees the populated contents.
   thread classify, or guard with a `g_in_hook`-style reentrancy flag so the JIT's mprotect can't
   recurse into fopen/lock.
 **Acceptance:** JIT-heavy app runs without added latency spikes or deadlocks; `mprotect` semantics
-unchanged for the host process. ☐ device-tested
+unchanged for the host process. ☑ device-tested
+**Implementation:** when `real_mprotect` is unresolved the interposer now falls back to
+`syscall(SYS_mprotect, …)` (the kernel sets errno; the old `return -1` left errno stale and broke the
+host's mprotect). The range-classification (`dladdr` + package match + `c_add_exec_range`) is gated by
+a TLS `g_in_mprotect_hook` reentrancy flag so a JIT mprotect can't recurse into the linker lock / a
+`/proc` read from inside our own hook, and it saves/restores `errno` so the bookkeeping never perturbs
+the caller's result. (Deferred off-thread classification was the heavier alternative; the guard is the
+lower-risk fix and removes the deadlock/recursion hazard the finding flagged.)
+**Device (chatgpt, pairip VM + ART JIT — mprotect-heavy):** 7579 events correctly attributed to
+`libpairipcore.so` (classification intact), no deadlock/hang, 0 jnilog crash.
 
 ---
 

@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <errno.h>
 #include <elf.h>
 
@@ -330,18 +331,37 @@ static void install_loader_dlopen_hook(void) {
                    DL_KEY("lib")    C_CYAN    "libdl.so" C_RESET);
 }
 
+/* Reentrancy guard for the mprotect interposer (F11): the classification work
+ * below (dladdr, package refresh) may itself mprotect, and the JIT calls
+ * mprotect on a hot path — we must not recurse into the linker lock / a /proc
+ * read from inside our own hook. */
+static __thread int g_in_mprotect_hook = 0;
+
 int mprotect(void* addr, size_t len, int prot) {
     pthread_once(&mprotect_resolve_once, resolve_mprotect);
     int (*real)(void*, size_t, int) = real_mprotect;
-    if (!real) return -1;
+    if (!real) {
+        /* dlsym(RTLD_NEXT,"mprotect") failed — fall back to the raw syscall so
+         * the host process's mprotect never silently breaks and errno is set by
+         * the kernel rather than left stale (the old `return -1` reported a
+         * bogus failure with whatever errno happened to hold). (F11) */
+        return (int)syscall(SYS_mprotect, addr, len, prot);
+    }
     int result = real(addr, len, prot);
-    if (result == 0 && (prot & PROT_EXEC)) {
+    /* Track newly-executable app regions for caller-range filtering, but never
+     * re-entrantly (see g_in_mprotect_hook) and never letting this best-effort
+     * bookkeeping change the syscall's result/errno for the caller. (F11) */
+    if (result == 0 && (prot & PROT_EXEC) && !g_in_mprotect_hook) {
+        int saved_errno = errno;
+        g_in_mprotect_hook = 1;
         Dl_info info;
         if (dladdr(addr, &info) && info.dli_fname != NULL &&
             !c_is_system_lib_path(info.dli_fname) &&
             c_path_contains_package(info.dli_fname)) {
             c_add_exec_range((uintptr_t)addr, len);
         }
+        g_in_mprotect_hook = 0;
+        errno = saved_errno;
     }
     return result;
 }
