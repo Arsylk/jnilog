@@ -581,64 +581,12 @@ func TestNoColorDisablesANSI(t *testing.T) {
 	})
 }
 
-// ============================================================================
-// Call Frame Stack LIFO Property Test (Property 10)
-// ============================================================================
-
-// TestCallFrameStackLIFO verifies Property 10: Call Frame Stack LIFO Ordering.
-// For any sequence of N pushes on a thread ID followed by N pops, popped frames
-// appear in reverse order (last-in-first-out). Pop on empty stack returns nil
-// without panic.
-//
-// **Validates: Requirements 12.1–12.5**
-func TestCallFrameStackLIFO(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		// Use a unique thread ID per test iteration to avoid interference
-		tid := rapid.IntRange(100000, 999999).Draw(t, "tid")
-
-		// Clean up the stack for this tid before and after the test
-		stacksMu.Lock()
-		delete(threadStacks, tid)
-		stacksMu.Unlock()
-		defer func() {
-			stacksMu.Lock()
-			delete(threadStacks, tid)
-			stacksMu.Unlock()
-		}()
-
-		// Verify pop on empty stack returns nil without panic
-		result := popCallFrame(tid)
-		if result != nil {
-			t.Fatalf("popCallFrame on empty stack returned non-nil: %+v", result)
-		}
-
-		// Generate N frames and push them
-		n := rapid.IntRange(1, 20).Draw(t, "numFrames")
-		frames := make([]*callFrame, n)
-		for i := 0; i < n; i++ {
-			frames[i] = genCallFrame(t)
-			pushCallFrame(tid, frames[i])
-		}
-
-		// Pop all N frames and verify LIFO ordering (reverse order)
-		for i := n - 1; i >= 0; i-- {
-			popped := popCallFrame(tid)
-			if popped == nil {
-				t.Fatalf("popCallFrame returned nil at pop index %d (expected frame pushed at index %d)", n-1-i, i)
-			}
-			if popped != frames[i] {
-				t.Fatalf("LIFO violation: pop %d returned frame with jniName=%q, expected jniName=%q (push index %d)",
-					n-1-i, popped.jniName, frames[i].jniName, i)
-			}
-		}
-
-		// After popping all frames, stack should be empty again — pop returns nil
-		afterEmpty := popCallFrame(tid)
-		if afterEmpty != nil {
-			t.Fatalf("popCallFrame after draining stack returned non-nil: %+v", afterEmpty)
-		}
-	})
-}
+// NOTE: the former TestCallFrameStackLIFO (Property 10) and concurrency_test.go
+// were removed in the F5 test-honesty pass: they exercised a thread-local
+// pushCallFrame/popCallFrame LIFO stack that production no longer has. Call/
+// return pairing is now done by call_id (C-side per-thread call-id stack in
+// bridge.c + Go-side pendingCalls in event_pipe.go); testing the deleted mirror
+// asserted nothing about the shipping code.
 
 // ============================================================================
 // Property 11: JNI Signature Parsing Correctness
@@ -752,6 +700,41 @@ func genJNIMethodSignature(t *rapid.T) (sig string, paramNames []string, retName
 	return sigBuilder.String(), paramNames, retN
 }
 
+// paramDescriptors splits a JNI method signature's parameter list into the
+// individual raw param descriptors (e.g. "(I[Ljava/lang/String;)V" → ["I",
+// "[Ljava/lang/String;"]). Independent of the production parser — used to check
+// rendered array dimensions against the raw `[` prefixes (F5).
+func paramDescriptors(sig string) []string {
+	open := strings.IndexByte(sig, '(')
+	closeP := strings.IndexByte(sig, ')')
+	if open < 0 || closeP < 0 || closeP < open {
+		return nil
+	}
+	body := sig[open+1 : closeP]
+	var out []string
+	for i := 0; i < len(body); {
+		start := i
+		for i < len(body) && body[i] == '[' {
+			i++ // array dimensions
+		}
+		if i >= len(body) {
+			break
+		}
+		if body[i] == 'L' {
+			for i < len(body) && body[i] != ';' {
+				i++
+			}
+			if i < len(body) {
+				i++ // include the ';'
+			}
+		} else {
+			i++ // single primitive char
+		}
+		out = append(out, body[start:i])
+	}
+	return out
+}
+
 // stripANSI removes all ANSI escape sequences from a string.
 func stripANSI(s string) string {
 	var result strings.Builder
@@ -838,18 +821,27 @@ func TestJNISignatureParsing(t *testing.T) {
 			t.Fatalf("output still contains '/' (should be converted to '.') for sig %q: %q", sig, plain)
 		}
 
-		// (e) Verify array `[]` suffixes match `[` prefix count in the original descriptor
-		// For each param that had array prefixes, verify the output has matching [] suffixes
-		for i, name := range paramNames {
-			expectedBrackets := strings.Count(name, "[]")
-			if expectedBrackets > 0 {
-				// Find this param in the output and count [] occurrences
-				actualBrackets := strings.Count(paramSection, name)
-				if actualBrackets == 0 {
-					// The param name should appear in the param section
-					t.Fatalf("array param %d (%q) not found in param section %q for sig %q",
-						i, name, paramSection, sig)
-				}
+		// (e) The rendered `[]`-suffix count for each param MUST equal the number
+		// of array-dimension `[` prefixes in that param's raw descriptor. The old
+		// check only asserted the param name appeared somewhere — it never tied
+		// the suffix count to the prefix count, so a renderer that dropped or
+		// duplicated a dimension would pass. Re-parse the raw sig independently
+		// and compare counts (F5 test nit).
+		rawParams := paramDescriptors(sig)
+		if len(rawParams) != len(paramNames) {
+			t.Fatalf("param-count mismatch for sig %q: %d raw descriptors vs %d names",
+				sig, len(rawParams), len(paramNames))
+		}
+		for i, raw := range rawParams {
+			wantDims := 0
+			for wantDims < len(raw) && raw[wantDims] == '[' {
+				wantDims++
+			}
+			gotDims := strings.Count(paramNames[i], "[]")
+			if gotDims != wantDims {
+				t.Fatalf("param %d (descriptor %q): rendered %q has %d []-suffixes, "+
+					"raw descriptor has %d [-prefixes (sig %q)",
+					i, raw, paramNames[i], gotDims, wantDims, sig)
 			}
 		}
 	})
@@ -1782,51 +1774,65 @@ func TestThreeTierGateFiltering(t *testing.T) {
 			name = rapid.StringMatching(`[A-Z][a-zA-Z]{2,20}`).Draw(t, "arbitraryName")
 		}
 
-		// Determine expected behavior based on the config's derived sets
-		isBlacklisted := c.blacklistSet != nil && c.blacklistSet[name]
-		whitelistEmpty := c.enabledSet == nil
-		isWhitelisted := c.enabledSet != nil && c.enabledSet[name]
-
-		// (a) If the name appears in the expanded blacklist, configFunctionBlacklisted
-		// SHALL return true regardless of whitelist membership.
-		if isBlacklisted {
-			if !configFunctionBlacklisted(name) {
-				t.Fatalf("(a) name %q is in blacklist but configFunctionBlacklisted returned false.\n"+
-					"blacklistSet: %v", name, c.blacklistSet)
+		// Derive the EXPECTED gate behaviour INDEPENDENTLY from the raw config
+		// fields (Functions/Categories/Exclude) + the category-expansion map —
+		// NOT from c.enabledSet/c.blacklistSet, which are the very maps the gate
+		// reads. The old test consulted those derived sets, so it was tautological
+		// (it could not catch a bug in buildEnabledSet/buildBlacklistSet). This
+		// independent expansion also exercises set construction. (F5 test nit)
+		expandedWhitelist := map[string]bool{}
+		for _, fn := range c.Functions {
+			expandedWhitelist[fn] = true
+		}
+		for _, cat := range c.Categories {
+			for _, m := range categories[cat] {
+				expandedWhitelist[m] = true
 			}
-		} else {
-			// If not blacklisted, configFunctionBlacklisted should return false
-			if configFunctionBlacklisted(name) {
-				t.Fatalf("name %q is NOT in blacklist but configFunctionBlacklisted returned true.\n"+
-					"blacklistSet: %v", name, c.blacklistSet)
+		}
+		whitelistEmpty := len(c.Functions) == 0 && len(c.Categories) == 0
+		isWhitelisted := expandedWhitelist[name]
+
+		expandedBlacklist := map[string]bool{}
+		for _, fn := range c.Exclude.Functions {
+			expandedBlacklist[fn] = true
+		}
+		for _, cat := range c.Exclude.Categories {
+			for _, m := range categories[cat] {
+				expandedBlacklist[m] = true
+			}
+		}
+		isBlacklisted := expandedBlacklist[name]
+
+		// The gate functions under test are the SAME impls the cgo exports call
+		// (gate_shared.go) — not a test-only reimplementation (F5).
+
+		// (a) blacklist membership ⇒ configFunctionBlacklistedImpl true, else false.
+		if got := configFunctionBlacklistedImpl(name); got != isBlacklisted {
+			t.Fatalf("(a) name %q: configFunctionBlacklistedImpl=%v, expected %v.\n"+
+				"Exclude.Functions=%v Exclude.Categories=%v", name, got, isBlacklisted,
+				c.Exclude.Functions, c.Exclude.Categories)
+		}
+
+		// (b) non-empty whitelist that doesn't include the name ⇒ not enabled.
+		if !whitelistEmpty && !isWhitelisted {
+			if configFunctionEnabledImpl(name) {
+				t.Fatalf("(b) name %q not in non-empty whitelist but configFunctionEnabledImpl returned true.\n"+
+					"Functions=%v Categories=%v", name, c.Functions, c.Categories)
 			}
 		}
 
-		// (b) If the name does not appear in the expanded blacklist and the whitelist
-		// is non-empty and the name does not appear in the expanded whitelist,
-		// configFunctionEnabled SHALL return false.
-		if !isBlacklisted && !whitelistEmpty && !isWhitelisted {
-			if configFunctionEnabled(name) {
-				t.Fatalf("(b) name %q is not blacklisted, whitelist is non-empty, and name is not whitelisted, "+
-					"but configFunctionEnabled returned true.\n"+
-					"enabledSet: %v", name, c.enabledSet)
-			}
-		}
-
-		// (c) If both whitelist arrays are empty, configFunctionEnabled SHALL return
-		// true for all names.
+		// (c) empty whitelist ⇒ everything enabled.
 		if whitelistEmpty {
-			if !configFunctionEnabled(name) {
-				t.Fatalf("(c) whitelist is empty but configFunctionEnabled returned false for name %q.\n"+
-					"Functions: %v, Categories: %v", name, c.Functions, c.Categories)
+			if !configFunctionEnabledImpl(name) {
+				t.Fatalf("(c) whitelist empty but configFunctionEnabledImpl returned false for %q.", name)
 			}
 		}
 
-		// Additional: if whitelisted and not blacklisted, configFunctionEnabled should return true
-		if !isBlacklisted && isWhitelisted {
-			if !configFunctionEnabled(name) {
-				t.Fatalf("name %q is whitelisted and not blacklisted but configFunctionEnabled returned false.\n"+
-					"enabledSet: %v", name, c.enabledSet)
+		// (d) name in the expanded whitelist ⇒ enabled.
+		if !whitelistEmpty && isWhitelisted {
+			if !configFunctionEnabledImpl(name) {
+				t.Fatalf("(d) name %q is in the expanded whitelist but configFunctionEnabledImpl returned false.\n"+
+					"Functions=%v Categories=%v", name, c.Functions, c.Categories)
 			}
 		}
 	})

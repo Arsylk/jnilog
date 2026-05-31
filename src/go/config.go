@@ -254,9 +254,8 @@ func buildRegexList(c *Config) {
 
 //export config_function_blacklisted
 func config_function_blacklisted(cName *C.char) C.int {
-	name := C.GoString(cName)
-	c := loadCfg()
-	if c.blacklistSet != nil && c.blacklistSet[name] {
+	// Shared with the host gate test via configFunctionBlacklistedImpl (F5).
+	if configFunctionBlacklistedImpl(C.GoString(cName)) {
 		return 1
 	}
 	return 0
@@ -264,12 +263,7 @@ func config_function_blacklisted(cName *C.char) C.int {
 
 //export config_function_enabled
 func config_function_enabled(cName *C.char) C.int {
-	name := C.GoString(cName)
-	c := loadCfg()
-	if c.enabledSet == nil {
-		return 1
-	}
-	if c.enabledSet[name] {
+	if configFunctionEnabledImpl(C.GoString(cName)) {
 		return 1
 	}
 	return 0

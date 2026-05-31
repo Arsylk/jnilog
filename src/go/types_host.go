@@ -241,21 +241,9 @@ func configSignatureBlacklisted(key string) bool {
 	return false
 }
 
-func configFunctionBlacklisted(name string) bool {
-	c := loadCfg()
-	if c.blacklistSet == nil {
-		return false
-	}
-	return c.blacklistSet[name]
-}
-
-func configFunctionEnabled(name string) bool {
-	c := loadCfg()
-	if c.enabledSet == nil {
-		return true
-	}
-	return c.enabledSet[name]
-}
+// configFunctionEnabled / configFunctionBlacklisted moved to the untagged
+// gate_shared.go (configFunctionEnabledImpl / configFunctionBlacklistedImpl) so
+// the host gate test and the cgo gate exports share one implementation (F5).
 
 // ============================================================================
 // Call-key builder (mirrored from config.go)
@@ -337,39 +325,6 @@ func (frame *callFrame) callKey() string {
 
 func callKeyForFieldTarget(jniName, className, fieldName string, value JNIValue) string {
 	return jniName + "|" + className + "." + fieldName + ": " + methodTypeName(value)
-}
-
-// ============================================================================
-// Call frame stack (mirrored from main.go)
-// ============================================================================
-
-var (
-	threadStacks = make(map[int][]*callFrame)
-	stacksMu     sync.Mutex
-)
-
-func pushCallFrame(tid int, frame *callFrame) {
-	stacksMu.Lock()
-	defer stacksMu.Unlock()
-	threadStacks[tid] = append(threadStacks[tid], frame)
-}
-
-func popCallFrame(tid int) *callFrame {
-	stacksMu.Lock()
-	defer stacksMu.Unlock()
-	stack := threadStacks[tid]
-	if len(stack) == 0 {
-		return nil
-	}
-	frame := stack[len(stack)-1]
-	// MUST match main.go: drop the map entry when the tid's stack reaches
-	// zero so transient host-test threads don't leak.
-	if len(stack) == 1 {
-		delete(threadStacks, tid)
-	} else {
-		threadStacks[tid] = stack[:len(stack)-1]
-	}
-	return frame
 }
 
 // ============================================================================

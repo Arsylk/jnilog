@@ -563,16 +563,40 @@ compiled by `go test`). Tests in `pbt_test.go`, `concurrency_test.go` exercise t
 4. Extend the wire round-trip generator to exercise F9 (control bytes, Unicode, `\x1A`).
 **Acceptance:** `go test` compiles and exercises the android pairing/formatter logic (via the
 extracted untagged files); removing a real production function breaks a test. Coverage report
-shows `event_pipe.go` pairing covered. ☐ done
+shows `event_pipe.go` pairing covered. ◑ substantially done — concrete defects fixed; one extraction scoped as remainder
+**Done:**
+- (#2) Deleted the dead `threadStacks`/`pushCallFrame`/`popCallFrame` from `types_host.go` AND the
+  tests that drove them (`concurrency_test.go` removed entirely; `TestCallFrameStackLIFO` removed) —
+  they asserted a LIFO stack production no longer has (pairing is call-id based: C-side stack in
+  `bridge.c` + Go `pendingCalls`).
+- (#3) Extracted the gate decision into untagged `gate_shared.go` (`configFunctionEnabledImpl` /
+  `configFunctionBlacklistedImpl`); the cgo exports in `config.go` now call them, and the host test
+  calls the SAME functions — so a change/deletion breaks both the device build and the test. Device
+  re-verified: gate filters to exactly the configured categories (enabled=134).
+- (#4) Wire round-trip generator extended for F9 (done in the F9 commit).
+- Test-quality nits below.
+**Remainder (scoped, low-risk-to-defer):** the `lineFormatter`/format* methods and the
+`Config`/`loadCfg`/`callKey`/`methodTypeName` structs are still duplicated in `types_host.go` (a
+faithful, currently-tested mirror — a *drift hazard*, not a present defect). Fully collapsing them
+(move `logger.go`'s formatter + `config.go`'s structs to untagged files; factor `dispatchCall`/
+`dispatchReturn` pure pairing behind a `vis_*` interface for host pairing tests) is a mechanical but
+large relocation of already-tested code. Deferred to keep this pass low-risk on the shipping cgo
+build; tracked as a follow-up.
 
-### Test-quality nits (do alongside F5)  🟡
-- `pbt_test.go:800-810` — Property 11(d) never asserts `[]`-suffix count equals `[` prefix count;
-  make it real.
-- `TestThreeTierGateFiltering` (`pbt_test.go:1722`) derives "expected" from the same maps under
-  test (tautological); re-derive from raw `Functions`/`Categories` + category expansion.
-- Remove unused `formatter` vars (`pbt_test.go:1448,1802` etc.).
-- Add a C-side test harness (even a tiny `cgo`-less unit exe over `vis_encode_typed_args` and the
-  call-id stack) so the encoder isn't only validated by a Go reimplementation. ☐ done
+### Test-quality nits (do alongside F5)  🟡 ☑ done
+- ☑ Property 11 array brackets — now re-parses the raw sig (`paramDescriptors`) and asserts the
+  rendered `[]`-suffix count equals the descriptor's `[`-prefix count per param (was: only checked
+  the param name appeared, never tied suffix↔prefix).
+- ☑ `TestThreeTierGateFiltering` de-tautologized — expected whitelist/blacklist are now expanded
+  INDEPENDENTLY from raw `Functions`/`Categories`/`Exclude` + the category map (not from the
+  `enabledSet`/`blacklistSet` under test), and it calls the shared `configFunction*Impl`.
+- ⊘ "unused `formatter` vars" — none exist: Go's compiler rejects unused locals, so `go vet`/`go
+  build` would already fail; the cited vars are all used. No-op.
+- ☑ C-side test harness added: `cwire_test.go` compiles+runs a standalone C program (host `cc`,
+  `-Werror`) asserting the F9 escape round-trip (all 256 byte values), F7 `safe_trunc_len` (UTF-8 +
+  dangling `\x1A`), and the F6 call-id stack (LIFO/nesting/overflow/empty) — so the C algorithms are
+  validated by the C compiler directly, not only by the Go reimplementation. (Mirrors the production
+  statics with a documented sync note; the Go round-trip PBT cross-checks the escape contract.)
 
 ---
 
