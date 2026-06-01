@@ -267,9 +267,16 @@ void log_jni_lookup_deferred(
             return;
         }
     }
-    /* No consumer / no gref: emit with the raw clazz pointer as an opaque
-     * display id and no resolvable class name. */
-    event_pipe_emit_lookup((uintptr_t)clazz, lookup_type, name, sig, "", caller);
+    /* No consumer / no gref to render: emit the raw clazz pointer as an opaque
+     * display id, but with a NON-EMPTY sentinel class_name.  The consumer keys
+     * its off-thread render purely on class_name=="" (event_pipe.go
+     * dispatchLookup); the success path above also ships class_name=="" — but
+     * with a real gref.  An empty name here would be byte-for-byte identical to
+     * that deferred shape, so the consumer would call event_pipe_render_obj /
+     * DeleteGlobalRef on this raw (possibly stale, cross-thread) local-ref —
+     * JNI UB / CheckJNI abort.  The sentinel keeps the two wire shapes
+     * distinguishable so the consumer skips render here (F1). */
+    event_pipe_emit_lookup((uintptr_t)clazz, lookup_type, name, sig, "<unresolved>", caller);
 }
 
 /*

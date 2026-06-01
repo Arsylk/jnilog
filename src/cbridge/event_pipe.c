@@ -155,19 +155,27 @@ static inline void put_i32(uint8_t  *p, size_t off, int32_t  v)  { put_u32(p, of
 
 /* Given that we intend to keep the first `len` bytes of NUL-terminated `s`
  * (len <= strlen(s)), back the cut off to a safe boundary so a truncated field
- * never desyncs the wire (F7).  Two hazards, both of which the blind clip used
+ * never desyncs the wire (F7).  Three hazards, all of which the blind clip used
  * to hit:
  *   1. UTF-8: if the first dropped byte is a continuation byte (10xxxxxx) the
  *      multibyte char straddles the cut — retreat to its char boundary so Go
  *      never sees invalid UTF-8 / a replacement char.
  *   2. A trailing lone "\x1A" deferred-render marker whose slot byte was cut
  *      off — drop it so the Go substituter never mistakes the next byte for a
- *      slot and the sidecar count never disagrees with the placeholders. */
+ *      slot and the sidecar count never disagrees with the placeholders.
+ *   3. A trailing lone "\x05" F9 escape lead-in (vea_append_escaped) whose
+ *      companion byte was cut off — drop it so Go's unescapeWireContent never
+ *      appends the bare 0x05 literally (a stray ENQ at the field tail). */
 static size_t safe_trunc_len(const char *s, size_t len) {
     while (len > 0 && ((unsigned char)s[len] & 0xC0) == 0x80) {
         len--;
     }
-    if (len > 0 && (unsigned char)s[len - 1] == 0x1A) {
+    /* 0x05 is always an escape lead-in and raw 0x1A content is itself escaped
+     * (to 0x05 0x5A), so a lone trailing 0x05/0x1A is always a malformed half,
+     * never legitimate data.  Loop so an adjacent marker+escape pair straddling
+     * the cut can't leave a dangling byte behind. */
+    while (len > 0 && ((unsigned char)s[len - 1] == 0x1A ||
+                       (unsigned char)s[len - 1] == 0x05)) {
         len--;
     }
     return len;

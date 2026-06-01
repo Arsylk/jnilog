@@ -18,14 +18,42 @@ xmake b jnilog
 xmake push                                 # convenience: adb push dist/libjnilog.so /data/local/tmp/
 
 # Filter with a config file (optional)
-echo '{"exclude":{"categories":["refs","strings"]}}' | adb shell tee /data/local/tmp/jnilog.json
+echo '{"categories":["methods","fields","lookups"],"array_items":16}' \
+  | adb shell tee /data/local/tmp/jnilog.json
 ```
 
-Injection into a target process is out of scope for this build — load the produced
-`.so` with your preferred mechanism (e.g. `LD_PRELOAD`, ptrace-based injector, or
-the Zygisk module pattern). The library detects its environment in
-`library_constructor` and self-installs the JNI table hooks when a `JavaVM` is
-available.
+**Inject and stream a live trace** with the companion loader,
+[`gozinject`](https://github.com/Arsylk/gozinject) — a root, ptrace-free zygote
+injector that `dlopen`s the payload into a fresh app process and hides its VMAs
+from the target:
+
+```bash
+cd ../gozinject
+xmake run --lib=/path/to/libjnilog.so --pkg=com.example.app \
+          --debug --logcat --logtag=JNILogPayload
+```
+
+That single command resolves the target's main activity, stages the payload,
+`am start`s the app, injects, and then tails the rendered JNI trace (logcat tag
+`JNILogPayload`) straight to your terminal. Any other injection vector works too
+(see [Loading the payload](#loading-the-payload-into-a-target-process)); the
+library self-installs the JNI-table hooks from `library_constructor` as soon as a
+`JavaVM` is available.
+
+### Live demo
+
+![jnilog live trace of a 360-Jiagu packed app](docs/media/jnilog-jiagu-sumiao.gif)
+
+The recording above (also as an
+[asciinema](https://asciinema.org) cast,
+[`docs/media/jnilog-jiagu-sumiao.cast`](docs/media/jnilog-jiagu-sumiao.cast)) runs the
+inject command against a **360-Jiagu (`libjiagu_64.so`) packed app**. You can watch the
+commercial packer's `com.stub.StubApp` native stub bootstrap itself through JNI —
+`dlopen` of `libjiagu_64.so` out of the app's private `.jiagu/` dir, then
+`getAppContext` → `ActivityThread.currentActivityThread` → `currentPackageName` →
+`Build.VERSION.SDK_INT` → `checkPermission(READ_PHONE_STATE)` — every call symbolized to
+`libjiagu_64.so!0xNNNN`, all before the first activity is drawn. Play the cast locally
+with `asciinema play docs/media/jnilog-jiagu-sumiao.cast`.
 
 ---
 
@@ -72,6 +100,61 @@ available.
 6. **Call execution** → original JNI function runs  
 7. **Return encoding** → `log_method_return_value` resolves the typed return value and emits a return record carrying the popped `call_id`  
 8. **Go reader** → a goroutine drains the socket, builds a `callFrame` into `pendingCalls` keyed by `call_id` on the CALL record, and on the matching RETURN record pairs them (`LoadAndDelete`) → `emitCallFull` checks Gate 3 (regex blacklist), formats and writes  
+
+---
+
+## Wire protocol (`event_pipe`)
+
+Per-JNI-event cgo crossings into the Go runtime trip integrity VMs on anti-tamper
+apps (the cgo dispatch fires Go-scheduler activity that is detectable across thread
+boundaries). So the hot path is **libc-only**: each hook serializes its arguments
+into one packed little-endian datagram and `send()`s it over an `AF_UNIX
+SOCK_DGRAM` socketpair; a Go reader goroutine drains the other end. Output is
+byte-identical to the old cgo-callback design — only the transport changed.
+
+```
+ offset  size  field
+ ────────────────────
+   0      4    magic = 'JNIE' (0x4A4E4945)
+   4      1    event type (EV_CALL=1, EV_RETURN=2, EV_LOOKUP=3,
+                            EV_OBJ_RETURN=4, EV_FIELD_ACCESS=5, EV_REGISTER_NATIVES=6)
+   5      1    receiver_kind   (CALL only)
+   6      1    ret_kind        (RETURN only)
+   7      1    nstrings        (string slots that follow)
+   8      4    offset (int32, caller PC − library base)
+  12      4    reserved
+  16      8    call_id         (monotonic; pairs CALL ↔ RETURN)
+  24      8    mid_or_raw      (mid for CALL · ret_raw for RETURN · clazz for LOOKUP)
+  32      …    strings[i] = u16-le length + raw bytes (no NUL)
+```
+
+String slots per event:
+
+| Event | Strings |
+|---|---|
+| `EV_CALL` | `jni_name, receiver_str, receiver_extra, class_name, method_name, encoded_args, caller` |
+| `EV_RETURN` | `name, ret_str, ret_extra` |
+| `EV_LOOKUP` | `lookup_type, name, sig, class_name, caller` |
+| `EV_FIELD_ACCESS` | `name, receiver_str, receiver_extra, field_name, value_str, value_extra, caller` |
+| `EV_REGISTER_NATIVES` | `class_name, methods, caller` (clazz in `mid_or_raw`) |
+
+**Bounded, desync-proof framing.** Datagrams are capped (`EVENT_PIPE_MAX_BYTES =
+8192`); long strings are truncated on safe boundaries so a giant `toString()` can't
+desync the stream. Content bytes that collide with framing markers
+(`\x01`–`\x05`, `\x1A`) are escaped as a 2-byte `(\x05, b^0x40)` pair, and a
+truncation that lands mid-escape or mid-UTF-8 retreats to a clean boundary. When
+the writer socket is full (consumer behind), events are **dropped, never blocked**;
+`event_pipe_drops()` exposes a monotonic drop count for observability.
+
+**Deferred render & global-ref ownership.** Resolving a `jclass`/`jobject` to a
+name or `toString()` needs a JNIEnv, which the hook must not use on the app's
+thread. Instead the hook `NewGlobalRef`s the object (only when a consumer is
+attached and draining — `event_pipe_consumer_ready()`), records it in a per-thread
+sidecar, and writes a `\x1A<slot>` placeholder into the string. The Go reader —
+attached as a daemon thread with its own JNIEnv — substitutes each placeholder by
+rendering the ref off-thread, then `DeleteGlobalRef`s it. Ownership transfers to the
+consumer **iff the datagram is delivered**; on overflow/failure the hook frees the
+refs itself, so a dropped event never leaks a global ref.
 
 ---
 
@@ -334,8 +417,62 @@ single `.so` containing the Go runtime plus the C hook layer, linking
 
 ## Loading the payload into a target process
 
-This repository ships only the payload `.so` — loading it into a target process
-is intentionally out of scope. Pick the injection vector that fits your context:
+The payload is a plain `.so`; anything that gets it mapped into the target with a
+live `JavaVM` will work. The companion loader is the path of least resistance:
+
+- **[`gozinject`](https://github.com/Arsylk/gozinject) (recommended)** — a root,
+  `ptrace`-free, fork-time zygote injector. One command builds, stages, launches,
+  injects, and (optionally) tails the trace:
+  ```bash
+  xmake run --lib=dist/libjnilog.so --pkg=com.example.app --debug --logcat --logtag=JNILogPayload
+  ```
+
+### How gozinject loads the payload
+
+Rather than attach to a running process, gozinject catches the target *at fork
+time*, in the narrow window after `fork()` but before the app's anti-tamper arms:
+
+1. **Trap `setArgV0`.** It byte-patches
+   `android_os_Process_setArgV0` in `/system/lib64/libandroid_runtime.so` — the
+   framework calls this exactly once per forked app, to rename the process from
+   `<pre-initialized>` to its package name. A 428-byte stub filters by `getpid()`
+   (zygote) + `getuid()` (target app UID), so unrelated forks fall straight through
+   to the real `setArgV0`.
+2. **Stub → stage → `dlopen`.** The matched child `mmap`s a 256 KB RWX region,
+   reads in a 4 KB stage, and the stage `dlopen`s the payload from a per-app temp
+   file in `/data/data/<pkg>/`. The injector restores the original `setArgV0` bytes
+   the moment the child is spotted, so the trap is live for a single fork.
+3. **Conceal.** Once loaded, the injector **`UnlinkSoinfo`** (removes the payload
+   from the linker's `soinfo` list) and **hides the payload's VMAs** (file
+   segments, guards, `.bss`, and the stage region) so the mapping is invisible in
+   the child's `/proc/self/maps`. No `ptrace`, no debugger attach, no persistent
+   on-disk artifact.
+
+### The `vma_hide` kernel module
+
+The VMA-hiding step (3) is what makes the injection invisible to a same-process
+anti-tamper scan of `/proc/self/maps`, and it is **not** pure userspace — it
+depends on a **custom kernel module** that exposes `/proc/vma_hide` with a per-UID
+hide list:
+
+```
+add   <uid> 0x<start> 0x<end>     # hide [start,end) from this UID's /proc/self/maps
+clear <uid>                       # drop this UID's hide list
+clear                             # drop all hide lists
+```
+
+gozinject writes `add <uid> …` for each payload segment after `dlopen`, and
+`clear <uid>` at the start of every run. Without this module the injection still
+*works*, but the payload's mappings remain visible — i.e. you lose the maps-level
+stealth layer, not the tracing. Validated on **Android 16 (API 36), arm64, kernel
+4.19** with the module present, against a jiagu-packed app (end-to-end the child
+shows no injection artifact in `/proc/self/maps`). Requirements: a rooted device
+(Magisk / KernelSU / APatch — `su -c` must work), the `vma_hide` kernel module, and
+SELinux permissive **or** a policy that lets root write `/proc/vma_hide`. See the
+[gozinject README](https://github.com/Arsylk/gozinject) for the module's full ABI
+and build.
+
+Other vectors, if gozinject doesn't fit your environment:
 
 - **`LD_PRELOAD`** — works for a fresh fork of an executable you control. The
   payload constructor detects this case via the `LD_PRELOAD` env var and
@@ -358,6 +495,34 @@ On load, the constructor runs through `init_once_handler` (`main.c`):
 
 Per-process config is read from `/data/local/tmp/jnilog.json` (or
 `JNILOG_CONFIG=<path>`); see [`docs/CONFIG_SCHEMA.json`](docs/CONFIG_SCHEMA.json).
+
+---
+
+## Device bring-up & recording notes
+
+Real gotchas seen bringing this up on a rooted Android 16 (APatch) device:
+
+- **No trace appears — wrong logcat tag.** The payload logs under the fixed tag
+  `JNILogPayload` (`bridge.h`). `gozinject --logtag` is a *logcat filter*, so it
+  must be `--logtag=JNILogPayload`; anything else filters your own output away.
+- **`adb push` to `/data/local/tmp` fails with "couldn't create file: Permission
+  denied".** On some Magisk/APatch setups `/data/local/tmp` is labeled
+  `shelltools_file`, and the `adbd` sync domain can't *create* files there — but it
+  *can* overwrite an existing file labeled `shell_data_file`. Pre-stage once:
+  ```bash
+  adb shell 'touch /data/local/tmp/foo'
+  adb shell su -c 'chcon u:object_r:shell_data_file:s0 /data/local/tmp/foo'
+  adb push local-foo /data/local/tmp/foo      # now an overwrite → succeeds
+  ```
+- **Recording the session hangs at "Deploying…".** Under a headless PTY (e.g.
+  `asciinema` with no controlling terminal) the loader's colored logger emits an
+  OSC background-color / cursor-position query and blocks on the reply that never
+  comes. Run with `TERM=dumb` — color is force-set regardless, so output stays
+  colored. (The recordings in `docs/media/` were captured this way via `script`.)
+- **The target app dies ~2 s after launch.** Hardened apps (e.g. pairip-protected)
+  detect the rooted/tampered environment and self-terminate; that is the app's
+  anti-tamper, independent of jnilog. The trace up to that point is valid. For
+  long-running stability tests, pick a target that stays alive.
 
 ---
 

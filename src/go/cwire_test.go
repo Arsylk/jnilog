@@ -50,10 +50,11 @@ const cWireTestSource = `
 #include <string.h>
 #include <stdio.h>
 
-/* ---- mirror of safe_trunc_len (event_pipe.c, F7) ---- */
+/* ---- mirror of safe_trunc_len (event_pipe.c, F7 + F9) ---- */
 static size_t safe_trunc_len(const char *s, size_t len) {
     while (len > 0 && ((unsigned char)s[len] & 0xC0) == 0x80) len--;
-    if (len > 0 && (unsigned char)s[len - 1] == 0x1A) len--;
+    while (len > 0 && ((unsigned char)s[len - 1] == 0x1A ||
+                       (unsigned char)s[len - 1] == 0x05)) len--;
     return len;
 }
 
@@ -95,8 +96,15 @@ int main(void) {
     assert(safe_trunc_len("x\xC3\xA9yz", 3) == 3);
     /* 3-byte UTF-8 cut mid-sequence -> drop whole char */
     assert(safe_trunc_len("\xE0\xA4\xB9Z", 2) == 0);
-    /* dangling \x1A dropped */
-    { const char s[] = {'a','b',0x1A}; assert(safe_trunc_len(s, 3) == 2); }
+    /* dangling \x1A dropped (cut drops the slot byte; s[len] is the dropped byte) */
+    { const char s[] = {'a','b',0x1A,'X',0}; assert(safe_trunc_len(s, 3) == 2); }
+    /* dangling \x05 escape lead-in dropped (companion byte cut off, F9) */
+    { const char s[] = {'a','b',0x05,'A',0}; assert(safe_trunc_len(s, 3) == 2); }
+    /* adjacent marker+escape straddling the cut: both halves dropped */
+    { const char s[] = {'a',0x1A,0x05,'A',0}; assert(safe_trunc_len(s, 3) == 1); }
+    /* a complete escape pair before the cut is kept intact (last kept byte is
+     * the companion 'A' = 0x01^0x40, not a lone lead-in) */
+    { const char s[] = {'a',0x05,'A','b',0}; assert(safe_trunc_len(s, 3) == 3); }
 
     /* escape round-trip over every byte value, incl. the special ones */
     for (int v = 0; v < 256; v++) {

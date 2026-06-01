@@ -300,22 +300,36 @@ static int cfg_lookup(const char *name, int *out) {
     uint32_t idx = (hash + (uint32_t)i) & CONFIG_CACHE_MASK;
     config_cache_entry_t *e = &g_cfg_cache[idx];
     if (e->result == -1) {
-      /* F18: drop the lock for the (blocking) Go round-trip.  Two threads
-       * racing the SAME fresh key can both reach here and both query Go; that
-       * is harmless — the re-check below lets only the first populate the slot,
-       * and the loser's identical result is simply discarded (not leaked).
-       * e->owned (strdup) is intentionally never freed: this is a
-       * process-lifetime cache bounded by CONFIG_CACHE_SIZE. */
+      /* F18: drop the lock for the (blocking) Go round-trip.  On re-acquire the
+       * slot may have been populated by another thread that raced us:
+       *   - SAME key (or a same-key strdup): the winner's result is identical to
+       *     ours, so we adopt it.
+       *   - DIFFERENT hash-colliding key: the winner's result answers a
+       *     different name — we must NOT read it.  We return our own Go answer
+       *     and `name` gets cached on a later probe into a free slot.
+       * The identity re-check below distinguishes the two.  e->owned (strdup) is
+       * intentionally never freed: a process-lifetime cache bounded by
+       * CONFIG_CACHE_SIZE. */
       pthread_mutex_unlock(&g_cfg_cache_lock);
       int allowed = 1;
       if (config_function_blacklisted((char *)name)) allowed = 0;
       else if (!config_function_enabled((char *)name)) allowed = 0;
       pthread_mutex_lock(&g_cfg_cache_lock);
-      /* Re-check the slot — another thread may have populated it.  Write owned
-       * (and key) before result so a concurrent reader that sees result != -1
-       * also sees a fully populated entry (all under the lock). */
-      if (e->result == -1) { e->owned = strdup(name); e->key = name; e->result = allowed; }
-      *out = e->result;
+      /* Re-check the slot under the lock.  Write owned (and key) before result
+       * so a concurrent reader that sees result != -1 also sees a fully
+       * populated entry. */
+      if (e->result == -1) {
+        /* Slot still fresh — we win; populate it. */
+        e->owned = strdup(name); e->key = name; e->result = allowed;
+        *out = e->result;
+      } else if (e->owned && strcmp(e->owned, name) == 0) {
+        /* Same key won the race — adopt its identical result. */
+        *out = e->result;
+      } else {
+        /* A different, hash-colliding key won this slot while we queried Go.
+         * Its result answers a different name, so return our own Go answer. */
+        *out = allowed;
+      }
       pthread_mutex_unlock(&g_cfg_cache_lock);
       return 1;
     }
