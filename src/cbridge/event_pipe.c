@@ -37,7 +37,7 @@
  * rather than depending on bridge.h ordering. */
 #if __has_include(<android/log.h>)
 #include <android/log.h>
-#define EVP_LOG(...) __android_log_print(ANDROID_LOG_INFO, "JNILogPayload", __VA_ARGS__)
+#define EVP_LOG(...) __android_log_print(ANDROID_LOG_INFO, "JniLog", __VA_ARGS__)
 #else
 #define EVP_LOG(...) ((void)0)
 #endif

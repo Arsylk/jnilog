@@ -26,7 +26,7 @@
 
 #include "ansi.h"
 
-#define RANGESET_LOG_TAG "JNILog"
+#define RANGESET_LOG_TAG "JniLog"
 
 /* ====================================================================
  * Package name

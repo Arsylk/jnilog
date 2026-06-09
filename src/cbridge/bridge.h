@@ -12,7 +12,7 @@ extern "C" {
 
 #include <android/log.h>
 
-#define LOG_TAG "JNILogPayload"
+#define LOG_TAG "JniLog"
 #define LOG_DIRECT(priority, fmt, ...) __android_log_print(priority, LOG_TAG, fmt, ##__VA_ARGS__)
 
 typedef struct JNINativeInterface JNINativeInterface;

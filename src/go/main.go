@@ -16,7 +16,7 @@ package main
 #ifndef GO_LOGCAT_WRITE_DEFINED
 #define GO_LOGCAT_WRITE_DEFINED
 static inline void go_logcat_write(int priority, const char* message) {
-  __android_log_write(priority, "JNILogPayload", message);
+  __android_log_write(priority, "JniLog", message);
 }
 #endif
 

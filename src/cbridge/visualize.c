@@ -15,7 +15,7 @@
 #include "visualize.h"
 #include "hook_internal.h"
 
-#define VIS_LOG_TAG "JNILogVisualize"
+#define VIS_LOG_TAG "JniLog"
 #if __has_include(<android/log.h>)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, VIS_LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, VIS_LOG_TAG, __VA_ARGS__)
