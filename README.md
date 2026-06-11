@@ -90,6 +90,15 @@ with `asciinema play docs/media/jnilog-jiagu-sumiao.cast`.
 └──────────────────────────────────────────────────────────────┘
 ```
 
+### Freestanding C-bridge (no libc)
+
+The entire C bridge is built **without any reroute­able libc calls** — str/mem, `vsnprintf`,
+heap, locks, I/O, and `dladdr` are reimplemented in-tree (`src/cbridge/freestanding/`) on raw
+`svc` syscalls, a futex, an mmap allocator, and a `/proc/self/maps` symbolizer. The bridge
+issues zero `strlen`/`malloc`/`send`/… through its own GOT, so a co-injected GOT/PLT-patching
+libc logger (or a packer's libc hooks) cannot observe the payload's internals. A readelf
+import gate in the build enforces this. (The Go runtime keeps its own cold libc imports.)
+
 ### Data flow
 
 1. **Hook entry** → checks `should_log_from_caller` (is caller from a tracked library?)  
@@ -268,7 +277,10 @@ Place a JSON file at `/data/local/tmp/jnilog.json` (or set `JNILOG_CONFIG` env v
     "categories": [],      // Blacklist category expansion.
     "regex":      []       // Regex patterns matched against call-key strings.
   },
-  "array_items": 16        // Max array elements before "+N more" truncation.
+  "array_items": 16,       // Max array elements before "+N more" truncation.
+  "class_name_only": false // true → never call app toString(); render objects by
+                           // class name only. Opt-in safety valve for anti-analysis
+                           // targets where even a guarded toString() is unwanted.
 }
 ```
 
@@ -283,6 +295,21 @@ Place a JSON file at `/data/local/tmp/jnilog.json` (or set `JNILOG_CONFIG` env v
 | `strings` | 12 | All `*String*` operations |
 | `refs` | 10 | All `*GlobalRef`, `*LocalRef`, `IsSameObject`, `Push/PopLocalFrame`, `EnsureLocalCapacity` |
 | `lookups` | 5 | `FindClass`, `GetMethodID`, `GetStaticMethodID`, `GetFieldID`, `GetStaticFieldID` |
+
+### Interactive configurator (`tools/jnilogcfg`)
+
+A standalone Go TUI/CLI builds and deploys this config without hand-editing JSON — toggle
+categories (off / include / exclude), fuzzy-pick individual functions with autocomplete, set
+`array_items`, with a live JSON preview:
+
+```sh
+xmake cfgtui                              # interactive TUI on docs/jnilog.json
+xmake cfgbuild                            # build the host binary into dist/jnilogcfg
+dist/jnilogcfg -f docs/jnilog.json -push  # non-interactive: save + adb push to the device
+```
+
+In the TUI, `p`/`P` push/pull the config to/from `/data/local/tmp/jnilog.json` on the device.
+It mirrors the schema above exactly. See `tools/jnilogcfg/README.md`.
 
 ### Three-tier gate system
 
