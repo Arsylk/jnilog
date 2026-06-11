@@ -85,7 +85,7 @@ static inline void field_obj_parts(JNIEnv *env, jobject obj,
              : (CType)0;                                                        \
     }                                                                           \
     field_log_ctx_t ctx;                                                        \
-    prepare_field_log_ctx(&ctx, env, obj, field_id, caller);                    \
+    prepare_field_log_ctx(&ctx, env, obj, field_id, caller, 0);                    \
     CType result = g_original_jni_table->Get##Name##Field(env, obj, field_id); \
     jni_return_value_t rv; rv.UnionF = result;                                  \
     log_field_access_result(env, &ctx, "Get" #Name "Field",                    \
@@ -110,7 +110,7 @@ static inline void field_obj_parts(JNIEnv *env, jobject obj,
       return;                                                                   \
     }                                                                           \
     field_log_ctx_t ctx;                                                        \
-    prepare_field_log_ctx(&ctx, env, obj, field_id, caller);                    \
+    prepare_field_log_ctx(&ctx, env, obj, field_id, caller, 0);                    \
     emit_field_access_begin(CALL_TARGET_INSTANCE, "Set" #Name "Field",          \
                             JNI_SLOT(Set##Name##Field), &ctx,                   \
                             (WireKindExpr), (RawExpr), "", "");                 \
@@ -130,7 +130,7 @@ static inline void field_obj_parts(JNIEnv *env, jobject obj,
       return;                                                                    \
     }                                                                            \
     field_log_ctx_t ctx;                                                         \
-    prepare_field_log_ctx(&ctx, env, obj, field_id, caller);                     \
+    prepare_field_log_ctx(&ctx, env, obj, field_id, caller, 0);                     \
     if (ctx.should_log && ctx.logging_ready) {                                   \
       set_reentrant_call(1);                                                     \
       int vkind; uintptr_t vraw; char *vstr, *vextra;                           \
@@ -162,7 +162,7 @@ static inline void field_obj_parts(JNIEnv *env, jobject obj,
              : (CType)0;                                                        \
     }                                                                           \
     field_log_ctx_t ctx;                                                        \
-    prepare_field_log_ctx(&ctx, env, clazz, field_id, caller);                  \
+    prepare_field_log_ctx(&ctx, env, clazz, field_id, caller, 1);                  \
     CType result = g_original_jni_table->GetStatic##Name##Field(env, clazz, field_id); \
     jni_return_value_t rv; rv.UnionF = result;                                  \
     log_field_access_result(env, &ctx, "GetStatic" #Name "Field",               \
@@ -186,7 +186,7 @@ static inline void field_obj_parts(JNIEnv *env, jobject obj,
       return;                                                                    \
     }                                                                            \
     field_log_ctx_t ctx;                                                         \
-    prepare_field_log_ctx(&ctx, env, clazz, field_id, caller);                   \
+    prepare_field_log_ctx(&ctx, env, clazz, field_id, caller, 1);                   \
     emit_field_access_begin(CALL_TARGET_STATIC, "SetStatic" #Name "Field",       \
                             JNI_SLOT(SetStatic##Name##Field), &ctx,              \
                             (WireKindExpr), (RawExpr), "", "");                  \
@@ -205,7 +205,7 @@ static inline void field_obj_parts(JNIEnv *env, jobject obj,
       return;                                                                    \
     }                                                                            \
     field_log_ctx_t ctx;                                                         \
-    prepare_field_log_ctx(&ctx, env, clazz, field_id, caller);                   \
+    prepare_field_log_ctx(&ctx, env, clazz, field_id, caller, 1);                   \
     if (ctx.should_log && ctx.logging_ready) {                                   \
       set_reentrant_call(1);                                                     \
       int vkind; uintptr_t vraw; char *vstr, *vextra;                           \

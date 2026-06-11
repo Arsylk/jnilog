@@ -606,6 +606,12 @@ func (f lineFormatter) formatAddress(caller string) string {
 			// library!symbol (offset is zero, no suffix)
 			res += f.colorize(ansiBlue, after)
 		}
+	} else if plus := strings.SplitN(caller, "+0x", 2); len(plus) == 2 {
+		// library+0xNN wire form → in-memory/decrypted code (packer .bss / JIT),
+		// not on disk. Keep the project's "library!offset" structure (lavender
+		// lib, orange offset); the "!" is YELLOW (vs the on-disk PINK "!") as the
+		// at-a-glance tell that the offset is into the runtime image, not the file.
+		res += f.colorize(ansiLavender, plus[0]) + f.colorize(ansiYellow, "!") + f.colorize(ansiOrange, "0x"+plus[1])
 	} else if strings.HasPrefix(caller, "0x") || strings.HasPrefix(caller, "0X") {
 		// Raw hex address (no library resolved)
 		res += f.colorize(ansiOrange, strings.ToLower(caller))
@@ -855,7 +861,11 @@ func emitExceptionEvent(offset int, frame *callFrame, result JNIValue) bool {
 }
 
 // emitCallFull renders a complete method call + return as one log line.
-func emitCallFull(offset int, frame *callFrame, result JNIValue) {
+func (f lineFormatter) callIDBadge(id uint64) string {
+	return f.colorize(ansiSubtle, "#"+strconv.FormatUint(id, 16))
+}
+
+func emitCallFull(offset int, frame *callFrame, result JNIValue, id uint64) {
 	f := hostFormatter
 
 	if configSignatureBlacklisted(frame.callKey()) {
@@ -867,7 +877,7 @@ func emitCallFull(offset int, frame *callFrame, result JNIValue) {
 		return
 	}
 
-	methodTag := f.dim("[" + frame.jniName + "]")
+	methodTag := f.dim("[" + frame.jniName + "]") + " " + f.callIDBadge(id)
 
 	var receiverStr string
 	if frame.receiver.Kind != KindNull && frame.receiver.Kind != KindVoid {
@@ -896,25 +906,22 @@ func emitCallFull(offset int, frame *callFrame, result JNIValue) {
 		prettyCall = f.formatPrettyCallTyped(frame.className, frame.methodName, frame.args)
 	}
 
-	resultStr := f.formatJNIValue(result)
+	// CALL line (receiver + args + caller); RETURN value goes on its own line
+	// below, linked by the #id badge. Mirrors the android emitCallFull.
+	writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s %s",
+		f.formatOffset(offset),
+		methodTag,
+		receiverStr,
+		prettyCall,
+		f.formatAddress(frame.caller),
+	))
 
 	if result.Kind != KindVoid {
-		writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s %s %s %s",
+		writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s",
 			f.formatOffset(offset),
 			methodTag,
-			receiverStr,
-			prettyCall,
 			f.formatArrow(),
-			resultStr,
-			f.formatAddress(frame.caller),
-		))
-	} else {
-		writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s %s",
-			f.formatOffset(offset),
-			methodTag,
-			receiverStr,
-			prettyCall,
-			f.formatAddress(frame.caller),
+			f.formatJNIValue(result),
 		))
 	}
 }

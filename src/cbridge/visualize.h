@@ -34,6 +34,14 @@ int vis_is_class(JNIEnv* env, void* obj);
 char* vis_class_name(JNIEnv* env, void* clazz_ptr);
 char* vis_object_class_name(JNIEnv* env, void* obj_ptr);
 char* vis_object_tostring(JNIEnv* env, void* obj_ptr);
+
+/* Free a C string returned by a bridge function (vis_*, event_pipe_render_obj)
+ * via the in-tree allocator. See the matching note in event_pipe.h — Go must
+ * release bridge-allocated strings through here, not C.free. */
+void c_free_cstr(void *p);
+/* Class-name-only kill switch: when set non-zero, object rendering never invokes
+ * the app's toString(). Pushed from the Go config loader. See visualize.c. */
+void c_set_class_name_only(int v);
 char* vis_string_value(JNIEnv* env, void* str_ptr);
 /* Like vis_string_value but returns bare UTF-8 content WITHOUT wrapping quotes. */
 char* vis_string_value_raw(JNIEnv* env, void* str_ptr);

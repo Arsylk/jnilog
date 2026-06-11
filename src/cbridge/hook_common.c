@@ -59,7 +59,14 @@ void address_of_r(void *addr, char *buf, size_t bufsz) {
                     (unsigned long)((uintptr_t)addr - (uintptr_t)info.dli_saddr));
       return;
     }
-    (void)snprintf(buf, bufsz, "%s!0x%lx", name,
+    /* jl_dladdr_synth is set when addr is in the module's in-memory-only region
+     * (a packer's decrypted/JIT .bss absorbed past the file image). Emit a
+     * "<lib>+0x<off>" WIRE form (vs the on-disk "<lib>!0x<off>"). The '+' is only
+     * an internal discriminator for the Go renderer (formatAddress), which
+     * displays both with the project's "<lib>!offset" structure but colors this
+     * one's "!" differently — so the offset is understood as into the runtime
+     * image, not a byte offset to look up in the on-disk library. */
+    (void)snprintf(buf, bufsz, jl_dladdr_synth ? "%s+0x%lx" : "%s!0x%lx", name,
                    (unsigned long)((uintptr_t)addr - (uintptr_t)info.dli_fbase));
     return;
   }
@@ -253,6 +260,11 @@ field_info_t lookup_field_info(jfieldID field_id,
 
 int should_log_from_caller(JNIEnv *env, void *caller) {
   if (env == NULL || caller == NULL) return 0;
+  /* Hard backstop: NEVER log a caller inside our own payload, regardless of what
+   * got seeded. Identity-based (c_capture_self_range), so it holds even though
+   * the injector stages us under a random name and vma-hides us — the staged
+   * path matches the package filter and would otherwise be seeded as in-scope. */
+  if (c_is_self_addr((uintptr_t)caller)) return 0;
   if (c_should_try_seed()) c_seed_exec_ranges_from_maps();
   if (!c_has_exec_ranges()) return 0;
   return c_is_in_exec_range((uintptr_t)caller);
@@ -370,7 +382,7 @@ int protect_region(prot_region_t *region, int prot) {
 }
 
 prot_region_t jni_table_region(void *table, size_t table_size) {
-  long page_size = sysconf(_SC_PAGESIZE);
+  long page_size = jl_page_size();
   if (page_size <= 0) page_size = 4096;
   uintptr_t start = (uintptr_t)table;
   uintptr_t page_start = start & ~((uintptr_t)page_size - 1u);

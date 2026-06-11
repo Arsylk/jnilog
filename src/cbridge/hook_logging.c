@@ -283,7 +283,7 @@ void field_log_ctx_destroy(field_log_ctx_t *ctx) {
 }
 
 void prepare_field_log_ctx(field_log_ctx_t *ctx, JNIEnv *env, void *receiver,
-                           jfieldID field_id, void *caller) {
+                           jfieldID field_id, void *caller, int is_static) {
     field_log_ctx_init(ctx);
     if (!ctx || is_reentrant_call()) return;
     ctx->should_log = should_log_from_caller(env, caller);
@@ -294,15 +294,13 @@ void prepare_field_log_ctx(field_log_ctx_t *ctx, JNIEnv *env, void *receiver,
     set_reentrant_call(1);
     address_of_r(caller, ctx->caller_str, sizeof(ctx->caller_str));
 
-    ctx->receiver_kind = (int)classify_object(env, receiver);
-    fill_object_strings(env, receiver, &ctx->receiver_str, &ctx->receiver_extra);
-
-    /* lookup_field_info copies the cache strings into these ctx-owned buffers
-     * UNDER the cache read lock (F10) — a concurrent cache_field_signature can
-     * no longer torn-overwrite them across our reads — and the field name is
-     * resolved via ART only on a cache miss (F20), straight into field_name_buf
-     * (no shared __thread buffer). The returned pointers refer to the ctx
-     * buffers (or NULL when absent). */
+    /* Resolve the field first (name / sig / declaring class). lookup_field_info
+     * copies the cache strings into these ctx-owned buffers UNDER the cache read
+     * lock (F10) — a concurrent cache_field_signature can no longer torn-
+     * overwrite them across our reads — and the field name is resolved via ART
+     * only on a cache miss (F20). The returned pointers refer to the ctx buffers
+     * (or NULL when absent). Done before the receiver fill so static access can
+     * label its receiver with the resolved declaring class. */
     field_info_t info = lookup_field_info(field_id,
         ctx->field_name_buf, sizeof(ctx->field_name_buf),
         ctx->sig_buf,        sizeof(ctx->sig_buf),
@@ -310,6 +308,19 @@ void prepare_field_log_ctx(field_log_ctx_t *ctx, JNIEnv *env, void *receiver,
     ctx->field_name = info.name;
     ctx->sig        = info.sig;
     ctx->clazz_name = info.clazz;
+
+    if (is_static && ctx->clazz_name && ctx->clazz_name[0]) {
+        /* The receiver IS the class. Show the resolved declaring class name
+         * directly: a jclass routed through the deferred-render path renders to
+         * empty (classify_object always defers, and the consumer's jclass render
+         * yields nothing), which used to print "<unknown>.field". */
+        ctx->receiver_kind  = (int)WIRE_KIND_CLASS;
+        ctx->receiver_str   = strdup(ctx->clazz_name);
+        ctx->receiver_extra = NULL;
+    } else {
+        ctx->receiver_kind = (int)classify_object(env, receiver);
+        fill_object_strings(env, receiver, &ctx->receiver_str, &ctx->receiver_extra);
+    }
     set_reentrant_call(0);
 }
 

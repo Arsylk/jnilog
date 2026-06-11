@@ -5,6 +5,8 @@ package main
 /*
 #cgo CFLAGS: -I${SRCDIR}/../cbridge
 #include <stdlib.h>
+
+extern void c_set_class_name_only(int v);
 */
 import "C"
 
@@ -35,6 +37,10 @@ type Config struct {
 	Categories []string    `json:"categories"`
 	Exclude    ExcludeRule `json:"exclude"`
 	ArrayItems int         `json:"array_items"`
+	// ClassNameOnly disables app toString() invocation entirely so objects render
+	// by class name only (default false = toString on). Opt-in safety valve for
+	// anti-analysis-heavy targets where even a guarded toString() is unwanted.
+	ClassNameOnly bool `json:"class_name_only"`
 
 	// Populated after parsing (not in JSON):
 	enabledSet   map[string]bool
@@ -201,10 +207,19 @@ func loadConfig() {
 
 	cfg.Store(&c)
 
-	logNativeInfo(fmt.Sprintf("config: loaded %s (enabled=%d, blacklisted=%d, regex=%d, array=%d)",
+	// Push the class-name-only switch down to the C visualizer (default off →
+	// toString stays enabled). Set here rather than queried per-object so it stays
+	// off the hot path.
+	if c.ClassNameOnly {
+		C.c_set_class_name_only(1)
+	} else {
+		C.c_set_class_name_only(0)
+	}
+
+	logNativeInfo(fmt.Sprintf("config: loaded %s (enabled=%d, blacklisted=%d, regex=%d, array=%d, class_name_only=%v)",
 		path,
 		len(c.enabledSet), len(c.blacklistSet), len(c.regexList),
-		c.ArrayItems))
+		c.ArrayItems, c.ClassNameOnly))
 }
 
 func buildEnabledSet(c *Config) {

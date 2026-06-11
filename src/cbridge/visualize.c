@@ -145,6 +145,19 @@ static int vis_is_tostring_blocked(const char* class_name) {
     return 0;
 }
 
+/* Global "class-name-only" kill switch (config: "class_name_only": true). When
+ * set, vis_object_tostring_safe never invokes the app's toString() at all and
+ * objects render by class name only. The per-class blocklist above only skips
+ * KNOWN-destructive toString()s; this is the blunt opt-in for anti-analysis-heavy
+ * targets where even a guarded toString() — which can still block or have
+ * non-exception side effects — is unwanted. Pushed once from the Go config loader
+ * (c_set_class_name_only); read on app threads, hence atomic. Default 0 preserves
+ * the existing toString-on behaviour. */
+static int g_class_name_only = 0;
+void c_set_class_name_only(int v) {
+    __atomic_store_n(&g_class_name_only, v ? 1 : 0, __ATOMIC_RELEASE);
+}
+
 char* vis_object_tostring(JNIEnv* env, void* obj_ptr) {
     return vis_object_tostring_safe(env, obj_ptr, NULL);
 }
@@ -153,6 +166,8 @@ char* vis_object_tostring(JNIEnv* env, void* obj_ptr) {
  * class name to check against the blocklist. If class_name is NULL, resolves it. */
 char* vis_object_tostring_safe(JNIEnv* env, void* obj_ptr, const char* class_name) {
     if (obj_ptr == NULL || !vis_safe_to_call(env)) return NULL;
+    /* class_name_only mode: never call app toString(); render by class name. */
+    if (__atomic_load_n(&g_class_name_only, __ATOMIC_ACQUIRE)) return NULL;
 
     /* Check blocklist using provided or resolved class name */
     char* resolved_name = NULL;

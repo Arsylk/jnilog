@@ -133,12 +133,13 @@ static void refresh_package_name_if_needed(void) {
   }
 
   /* Fallback: read /proc/self/cmdline (available after zygote specialization). */
-  FILE *f = fopen("/proc/self/cmdline", "r");
-  if (f != NULL) {
+  int cmdfd = jl_openat("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+  if (cmdfd >= 0) {
     char buf[RANGESET_MAX_PACKAGE_NAME];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
-    if (n > 0) {
+    long r = jl_read(cmdfd, buf, sizeof(buf) - 1);
+    jl_close(cmdfd);
+    if (r > 0) {
+      size_t n = (size_t)r;
       size_t len = 0;
       while (len < n && buf[len] != '\0') len++;
       buf[len] = '\0';
@@ -177,29 +178,66 @@ int c_path_contains_package(const char *path) {
 }
 
 /* ====================================================================
- * Own-library path (for self-exclusion in the /proc/self/maps fallback)
+ * Own executable range (self-exclusion)
  * ==================================================================== */
 
-/* The injector stages this payload under a random name inside the app sandbox
- * (e.g. /data/data/<pkg>/.org.chromium.<hex>.tmp), so our on-disk path BOTH
- * matches the package-name filter AND is not the literal "libjnilog" the name
- * check looks for. The dl_iterate_phdr seed excludes us by load-base identity,
- * but the /proc/self/maps fallback excluded only by name — so the renamed
- * payload seeded its OWN executable segment as an app range and we logged every
- * JNI call our formatter makes (observed: 99% of output was self-noise). Capture
- * the real path via dladdr early, while our soinfo is still linked (the injector
- * unlinks it shortly after dlopen returns), and exclude by it. */
-static char g_self_lib_path[512] = {0};
+/* The one mechanism that keeps jnilog from logging its OWN JNI calls.
+ *
+ * The injector stages this payload under a RANDOM name inside the app sandbox
+ * (e.g. /data/data/<pkg>/.org.chromium.<hex>.tmp). That path matches the
+ * package-name filter and is NOT the literal "libjnilog", so every name-based
+ * self-check (a strstr "libjnilog") was dead on the real payload — and without
+ * a working exclusion the renamed payload seeds its own segment as an app range
+ * and logs every JNI call our own formatter makes (observed once: 99% of output
+ * was self-noise). Worse, shortly after dlopen the injector vma-hides us from
+ * /proc/maps AND soinfo-unlinks us from the linker solist, so any LATER lookup
+ * of ourselves — by name, by path, by maps, or by dladdr — fails outright; a
+ * per-reseed dladdr(self) returns NULL once we're hidden.
+ *
+ * So capture our load base + image extent ONCE, here, by IDENTITY (dladdr on
+ * our own code, then our own program headers) while we are still resolvable, and
+ * store it as plain numbers. c_is_self_addr() then answers "is this caller our
+ * own code?" on the hot path with two compares — name-independent, rename-proof,
+ * and immune to vma_hide / soinfo-unlink. */
+static uintptr_t g_self_base = 0, g_self_end = 0;
 
-static const char *self_lib_path(void) {
-  if (g_self_lib_path[0] == '\0') {
-    Dl_info info;
-    if (dladdr((void *)self_lib_path, &info) && info.dli_fname && info.dli_fname[0]) {
-      strncpy(g_self_lib_path, info.dli_fname, sizeof(g_self_lib_path) - 1);
-      g_self_lib_path[sizeof(g_self_lib_path) - 1] = '\0';
+void c_capture_self_range(void) {
+  if (g_self_base != 0) return;
+  Dl_info info;
+  if (!dladdr((void *)c_capture_self_range, &info) || info.dli_fbase == NULL) {
+#if __has_include(<android/log.h>)
+    __android_log_print(ANDROID_LOG_WARN, RANGESET_LOG_TAG,
+                        "c_capture_self_range: dladdr(self) failed — self-exclusion degraded");
+#endif
+    return;
+  }
+  uintptr_t base = (uintptr_t)info.dli_fbase;
+  uintptr_t end = 0;
+  /* base maps our ELF header (the first PT_LOAD at file offset 0); walk the
+   * program headers to find the end of the highest PT_LOAD so the range covers
+   * every segment a return address could land in. */
+  const Elf64_Ehdr *eh = (const Elf64_Ehdr *)base;
+  if (memcmp(eh->e_ident, ELFMAG, SELFMAG) == 0 && eh->e_phoff != 0) {
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(base + eh->e_phoff);
+    for (int i = 0; i < eh->e_phnum; i++) {
+      if (ph[i].p_type != PT_LOAD) continue;
+      uintptr_t seg_end = base + ph[i].p_vaddr + ph[i].p_memsz;
+      if (seg_end > end) end = seg_end;
     }
   }
-  return g_self_lib_path;
+  g_self_base = base;
+  /* Unreadable phdrs are not expected; fall back to a bounded span rather than 0
+   * (which would silently disable the check). */
+  g_self_end = (end > base) ? end : base + 0x800000;
+#if __has_include(<android/log.h>)
+  __android_log_print(ANDROID_LOG_INFO, RANGESET_LOG_TAG,
+                      "self range: " C_LAVENDER "%lx-%lx" C_RESET,
+                      (unsigned long)g_self_base, (unsigned long)g_self_end);
+#endif
+}
+
+int c_is_self_addr(uintptr_t addr) {
+  return g_self_base != 0 && addr >= g_self_base && addr < g_self_end;
 }
 
 /* ====================================================================
@@ -313,6 +351,9 @@ int c_should_try_seed(void) {
  * re-attempt seeding.  Called when something changes (dlopen, package name). */
 void c_reset_seed_attempted(void) {
   __atomic_store_n(&g_seed_attempted, 0, __ATOMIC_RELEASE);
+  /* A dlopen/package change also invalidates the symbolizer module table so
+   * the next caller lookup re-reads /proc/self/maps. */
+  jl_symbolize_refresh();
 }
 
 /* ====================================================================
@@ -344,7 +385,6 @@ static int c_seed_exec_ranges_from_proc_maps(void);
  * and could SIGSEGV on concurrent dlclose. */
 typedef struct {
   char pkg_snap[RANGESET_MAX_PACKAGE_NAME];
-  const void *self_fbase;
   int added;
 } seed_ctx_t;
 
@@ -355,9 +395,9 @@ static int seed_iter_cb(struct dl_phdr_info *info, size_t size, void *data) {
   const char *lib_name = info->dlpi_name;
   if (lib_name == NULL || lib_name[0] == '\0') return 0;
 
-  /* Exclude our own payload by load-base identity and by name. */
-  if (ctx->self_fbase && (const void *)info->dlpi_addr == ctx->self_fbase) return 0;
-  if (strstr(lib_name, "libjnilog") != NULL) return 0;
+  /* Exclude our own payload by load-base identity (rename-proof; see
+   * c_capture_self_range). dlpi_addr is the module's load bias, == our base. */
+  if (c_is_self_addr((uintptr_t)info->dlpi_addr)) return 0;
 
   /* Skip system libs / non-package paths. pkg_snap is the locked snapshot
    * (no race with a concurrent refresh_package_name_if_needed writer). */
@@ -416,11 +456,9 @@ int c_seed_exec_ranges_from_maps(void) {
   pthread_mutex_unlock(&g_range_pkg_lock);
   ctx.added = 0;
 
-  Dl_info self_info;
-  ctx.self_fbase = NULL;
-  if (dladdr((void *)c_seed_exec_ranges_from_maps, &self_info)) {
-    ctx.self_fbase = self_info.dli_fbase;
-  }
+  /* Self-exclusion is keyed off the identity range captured at init
+   * (c_capture_self_range), not a per-reseed dladdr(self) — which returns NULL
+   * once the injector has vma-hidden us. */
 
   /* Only iterate when we have a real package name. The seed-attempted flag in
    * c_should_try_seed prevents repeat iteration once we've tried; the previous
@@ -481,22 +519,20 @@ static int c_seed_exec_ranges_from_proc_maps(void) {
     return 0;
   }
 
-  FILE *f = fopen("/proc/self/maps", "r");
-  if (!f) return 0;
+  jl_linereader lr;
+  if (jl_lr_open(&lr, "/proc/self/maps", O_RDONLY | O_CLOEXEC) < 0) return 0;
 
   int added = 0;
-  /* getline grows `line` to fit the whole entry, so a long split-APK path
-   * (/data/app/~~base64==/pkg==/lib/arm64/libfoo.so [ (deleted)]) is no longer
-   * truncated at 512 B — which used to silently drop that lib from seeding (F12). */
-  char *line = NULL;
-  size_t line_cap = 0;
+  /* 1 KB line buffer so a long split-APK path
+   * (/data/app/~~base64==/pkg==/lib/arm64/libfoo.so [ (deleted)]) is not
+   * truncated at 512 B, which used to silently drop that lib from seeding (F12). */
+  char line[1024];
 
-  while (getline(&line, &line_cap, f) != -1) {
+  while (jl_lr_next(&lr, line, sizeof(line))) {
     /* Parse: start-end perms offset dev inode pathname */
     uintptr_t start, end;
     char perms[5];
-    int n = sscanf(line, "%lx-%lx %4s", (unsigned long*)&start, (unsigned long*)&end, perms);
-    if (n < 3) continue;
+    if (!jl_parse_maps_head(line, &start, &end, perms)) continue;
 
     /* Only executable regions */
     if (perms[2] != 'x') continue;
@@ -534,11 +570,9 @@ static int c_seed_exec_ranges_from_proc_maps(void) {
         strncmp(path, "/odm/", 5) == 0 ||
         strstr(path, "/bionic") != NULL) continue;
 
-    /* Skip our own payload. The "libjnilog" name check misses the injector's
-     * stealth rename, so also exclude by our real path captured via dladdr. */
-    if (strstr(path, "libjnilog") != NULL) continue;
-    const char *self = self_lib_path();
-    if (self[0] != '\0' && strcmp(path, self) == 0) continue;
+    /* Skip our own payload by load-base identity (rename-proof, and the only
+     * thing that survives the injector's vma_hide / soinfo-unlink). */
+    if (c_is_self_addr(start)) continue;
 
     /* Check if path contains the package name. Use the locked snapshot
      * (pkg_snap) taken at the top of this function — reading
@@ -557,8 +591,7 @@ static int c_seed_exec_ranges_from_proc_maps(void) {
     }
   }
 
-  free(line);
-  fclose(f);
+  jl_lr_close(&lr);
   return added;
 }
 
@@ -567,10 +600,11 @@ static int c_seed_exec_ranges_from_proc_maps(void) {
  * ==================================================================== */
 
 void c_init_range_tracking(void) {
-  /* Capture our own library path now, while our soinfo is still linked — the
-   * injector unlinks it shortly after dlopen returns. Used to exclude our own
-   * executable segment from the /proc/self/maps seed fallback. */
-  (void)self_lib_path();
+  /* Capture our own [base,end] now, while we are still resolvable — the injector
+   * vma-hides and soinfo-unlinks us shortly after dlopen returns. This is THE
+   * self-exclusion (c_capture_self_range); seeding and should_log_from_caller
+   * both key off it. */
+  c_capture_self_range();
 
   refresh_package_name_if_needed();
 

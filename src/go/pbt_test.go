@@ -1450,7 +1450,7 @@ func TestSingleLineLogOutput(t *testing.T) {
 		result := genJNIValue(t)
 
 		// Call emitCallFull with the generated frame and result
-		emitCallFull(0, frame, result)
+		emitCallFull(0, frame, result, 0)
 
 		// emitCallFull may suppress output if configSignatureBlacklisted matches,
 		// but with default config (empty regex list) it should always emit.
@@ -1686,47 +1686,53 @@ func TestMethodCallLineSchema(t *testing.T) {
 		result := genJNIValue(t)
 
 		// Call emitCallFull to produce the log line
-		emitCallFull(0, frame, result)
+		emitCallFull(0, frame, result, 0)
 
 		// Get the captured output
 		if len(sink.events) == 0 {
 			t.Fatalf("emitCallFull produced no output for frame.jniName=%q, result.Kind=%d",
 				frame.jniName, result.Kind)
 		}
-		output := sink.events[len(sink.events)-1].line
-
-		// (a) Output starts with dim [jniName] tag
-		// dim = \x1b[2m, so the tag should be: \x1b[2m[jniName]\x1b[0m
-		expectedDimTag := "\x1b[2m[" + frame.jniName + "]\x1b[0m"
-		if !strings.HasPrefix(output, expectedDimTag) {
-			t.Fatalf("(a) output should start with dim [%s] tag.\nExpected prefix: %q\nActual output starts with: %q",
-				frame.jniName, expectedDimTag, output[:min(len(output), len(expectedDimTag)+20)])
+		// emitCallFull writes a CALL line and (for non-void results) a separate
+		// RETURN line, linked by the #id badge. Check the call line for the tag +
+		// receiver and the combined output for the return arrow.
+		callLine := sink.events[0].line
+		var combined string
+		for _, e := range sink.events {
+			combined += e.line + "\n"
 		}
 
-		// Strip ANSI for structural checks on this= and arrow
-		plain := stripANSI(output)
+		// (a) Call line starts with dim [jniName] tag
+		// dim = \x1b[2m, so the tag should be: \x1b[2m[jniName]\x1b[0m
+		expectedDimTag := "\x1b[2m[" + frame.jniName + "]\x1b[0m"
+		if !strings.HasPrefix(callLine, expectedDimTag) {
+			t.Fatalf("(a) call line should start with dim [%s] tag.\nExpected prefix: %q\nActual: %q",
+				frame.jniName, expectedDimTag, callLine[:min(len(callLine), len(expectedDimTag)+20)])
+		}
 
-		// (b) If receiver is non-null and non-void, output contains "this="
+		// Strip ANSI for structural checks on this= (call line) and arrow (combined)
+		plainCall := stripANSI(callLine)
+
+		// (b) If receiver is non-null and non-void, the call line contains "this="
 		if frame.receiver.Kind != KindNull && frame.receiver.Kind != KindVoid {
-			if !strings.Contains(plain, "this=") {
-				t.Fatalf("(b) non-null/non-void receiver (Kind=%d) should produce 'this=' in output.\nPlain: %q",
-					frame.receiver.Kind, plain)
+			if !strings.Contains(plainCall, "this=") {
+				t.Fatalf("(b) non-null/non-void receiver (Kind=%d) should produce 'this=' on the call line.\nPlain: %q",
+					frame.receiver.Kind, plainCall)
 			}
 		}
 
-		// (c) If result Kind is not KindVoid, output contains "→"
+		// (c) If result Kind is not KindVoid, the output contains "→" (return line)
 		if result.Kind != KindVoid {
-			if !strings.Contains(output, "→") {
-				t.Fatalf("(c) non-void result (Kind=%d) should produce '→' in output.\nOutput: %q\nPlain: %q",
-					result.Kind, output, plain)
+			if !strings.Contains(combined, "→") {
+				t.Fatalf("(c) non-void result (Kind=%d) should produce '→' in output.\nCombined: %q",
+					result.Kind, combined)
 			}
 		}
 
 		// (d) If result Kind is KindVoid, output does NOT contain "→"
 		if result.Kind == KindVoid {
-			if strings.Contains(output, "→") {
-				t.Fatalf("(d) void result should NOT produce '→' in output.\nOutput: %q\nPlain: %q",
-					output, plain)
+			if strings.Contains(combined, "→") {
+				t.Fatalf("(d) void result should NOT produce '→' in output.\nCombined: %q", combined)
 			}
 		}
 	})
@@ -2192,7 +2198,7 @@ func TestExceptionEventFormatting(t *testing.T) {
 			caller:  "libapp.so!checkEx+0x1a",
 		}
 		result := JNIValue{Kind: KindBoolean, Int: 1}
-		emitCallFull(0, frame, result)
+		emitCallFull(0, frame, result, 0)
 
 		if len(sink.events) <= startIdx {
 			t.Fatal("ExceptionCheck/true produced no output")
@@ -2219,6 +2225,11 @@ func TestExceptionEventFormatting(t *testing.T) {
 	})
 
 	// --- Test 2: ExceptionCheck returns false ---
+	// NOTE: the C hook (hooked_ExceptionCheck) now SUPPRESSES the res==false
+	// case at the producer (it was ~35% noise), so a false ExceptionCheck no
+	// longer reaches the renderer in production. This test still validates the
+	// renderer's boolean-false rendering, which other false-returning boolean
+	// JNI calls (IsSameObject, IsInstanceOf, …) continue to exercise.
 	t.Run("ExceptionCheck/false", func(t *testing.T) {
 		startIdx := len(sink.events)
 		frame := &callFrame{
@@ -2226,7 +2237,7 @@ func TestExceptionEventFormatting(t *testing.T) {
 			caller:  "libapp.so!checkEx+0x1a",
 		}
 		result := JNIValue{Kind: KindBoolean, Int: 0}
-		emitCallFull(0, frame, result)
+		emitCallFull(0, frame, result, 0)
 
 		if len(sink.events) <= startIdx {
 			t.Fatal("ExceptionCheck/false produced no output")
@@ -2250,7 +2261,7 @@ func TestExceptionEventFormatting(t *testing.T) {
 			Str:   "java.lang.NullPointerException",
 			Extra: "Attempt to invoke virtual method on a null object reference",
 		}
-		emitCallFull(0, frame, result)
+		emitCallFull(0, frame, result, 0)
 
 		if len(sink.events) <= startIdx {
 			t.Fatal("ExceptionOccurred/non_null produced no output")
@@ -2287,7 +2298,7 @@ func TestExceptionEventFormatting(t *testing.T) {
 			caller:  "libapp.so!0x42",
 		}
 		result := JNIValue{Kind: KindNull}
-		emitCallFull(0, frame, result)
+		emitCallFull(0, frame, result, 0)
 
 		if len(sink.events) <= startIdx {
 			t.Fatal("ExceptionOccurred/null produced no output")
@@ -2316,7 +2327,7 @@ func TestExceptionEventFormatting(t *testing.T) {
 			caller: "libapp.so!throwIt+0x10",
 		}
 		result := JNIValue{Kind: KindVoid}
-		emitCallFull(0, frame, result)
+		emitCallFull(0, frame, result, 0)
 
 		if len(sink.events) <= startIdx {
 			t.Fatal("Throw produced no output")
@@ -2355,7 +2366,7 @@ func TestExceptionEventFormatting(t *testing.T) {
 			caller: "libapp.so!throwNew+0x20",
 		}
 		result := JNIValue{Kind: KindVoid}
-		emitCallFull(0, frame, result)
+		emitCallFull(0, frame, result, 0)
 
 		if len(sink.events) <= startIdx {
 			t.Fatal("ThrowNew produced no output")
@@ -2390,7 +2401,7 @@ func TestExceptionEventFormatting(t *testing.T) {
 			caller:  "libapp.so!clearEx+0x8",
 		}
 		result := JNIValue{Kind: KindVoid}
-		emitCallFull(0, frame, result)
+		emitCallFull(0, frame, result, 0)
 
 		if len(sink.events) <= startIdx {
 			t.Fatal("ExceptionClear produced no output")
@@ -2421,7 +2432,7 @@ func TestExceptionEventFormatting(t *testing.T) {
 			caller: "libapp.so!fatal+0x4",
 		}
 		result := JNIValue{Kind: KindVoid}
-		emitCallFull(0, frame, result)
+		emitCallFull(0, frame, result, 0)
 
 		if len(sink.events) <= startIdx {
 			t.Fatal("FatalError produced no output")

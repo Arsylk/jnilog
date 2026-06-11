@@ -247,7 +247,7 @@ func dispatchObjReturn(callID uint64, offset int, gref uintptr, name string) {
 		if !ok {
 			return
 		}
-		emitCallFull(pc.offset, pc.frame, buildReturnValue(int(KindNull), 0, "", ""))
+		emitCallFull(pc.offset, pc.frame, buildReturnValue(int(KindNull), 0, "", ""), callID)
 		return
 	}
 	var (
@@ -260,19 +260,19 @@ func dispatchObjReturn(callID uint64, offset int, gref uintptr, name string) {
 	extra := ""
 	if cStr != nil {
 		str = C.GoString(cStr)
-		C.free(unsafe.Pointer(cStr))
+		C.c_free_cstr(unsafe.Pointer(cStr))
 	}
 	if cExtra != nil {
 		extra = C.GoString(cExtra)
-		C.free(unsafe.Pointer(cExtra))
+		C.c_free_cstr(unsafe.Pointer(cExtra))
 	}
 	result := buildReturnValue(int(cKind), gref, str, extra)
 	pc, ok := pendingTake(callID)
 	if !ok {
-		emitStandaloneReturn(offset, name, result)
+		emitStandaloneReturn(offset, name, result, callID)
 		return
 	}
-	emitCallFull(pc.offset, pc.frame, result)
+	emitCallFull(pc.offset, pc.frame, result, callID)
 }
 
 func parseStrings(buf []byte, n int) ([]string, bool) {
@@ -317,11 +317,11 @@ func renderRefChunk(gref uintptr) string {
 	extra := ""
 	if cStr != nil {
 		str = C.GoString(cStr)
-		C.free(unsafe.Pointer(cStr))
+		C.c_free_cstr(unsafe.Pointer(cStr))
 	}
 	if cExtra != nil {
 		extra = C.GoString(cExtra)
-		C.free(unsafe.Pointer(cExtra))
+		C.c_free_cstr(unsafe.Pointer(cExtra))
 	}
 	var sig byte
 	switch int(cKind) {
@@ -474,7 +474,9 @@ func evictStalePending() {
 				pendingEvicted++
 				n++
 				pc := v.(*pendingCall)
-				emitCallFull(pc.offset, pc.frame, VoidValue)
+				// Return was dropped/never arrived — emit the call line alone
+				// (VoidValue → no return line), keyed by its own call_id.
+				emitCallFull(pc.offset, pc.frame, VoidValue, k.(uint64))
 			}
 		}
 		return true
@@ -516,14 +518,25 @@ func dispatchCall(callID uint64, offset int, receiverKind int, mid uintptr, strs
 
 func dispatchReturn(callID uint64, offset int, retKind int, retRaw uintptr, strs []string) {
 	// Slot order: name, ret_str, ret_extra
-	pc, ok := pendingTake(callID)
-	if !ok {
-		result := buildReturnValue(retKind, retRaw, strs[1], strs[2])
-		emitStandaloneReturn(offset, strs[0], result)
-		return
+	//
+	// retKind == 0xFE means the return is a deferred object: log_method_return_value
+	// pushed it to the sidecar and the placeholder substitution above already
+	// swapped strs[1] for the rendered "X\x01str[\x03extra]\x02" chunk. Decode it
+	// back into kind/str/extra (same as dispatchCall's receiver and evFieldAccess);
+	// without this every object-returning Call*Method rendered "→ null".
+	if retKind == 0xFE {
+		k, s, e := parseRenderedChunk(strs[1])
+		retKind = k
+		strs[1] = s
+		strs[2] = e
 	}
 	result := buildReturnValue(retKind, retRaw, strs[1], strs[2])
-	emitCallFull(pc.offset, pc.frame, result)
+	pc, ok := pendingTake(callID)
+	if !ok {
+		emitStandaloneReturn(offset, strs[0], result, callID)
+		return
+	}
+	emitCallFull(pc.offset, pc.frame, result, callID)
 }
 
 func dispatchLookup(clazz uintptr, strs []string) {
@@ -544,10 +557,10 @@ func dispatchLookup(clazz uintptr, strs []string) {
 		C.event_pipe_render_obj(consumerEnv, C.uintptr_t(clazz), &cKind, &cStr, &cExtra)
 		if cStr != nil {
 			className = C.GoString(cStr)
-			C.free(unsafe.Pointer(cStr))
+			C.c_free_cstr(unsafe.Pointer(cStr))
 		}
 		if cExtra != nil {
-			C.free(unsafe.Pointer(cExtra))
+			C.c_free_cstr(unsafe.Pointer(cExtra))
 		}
 		// NOTE: clazz holds the pointer value of the (now-deleted) gref.
 		// We preserve it as-is — emitJNILookup uses it purely as an opaque

@@ -97,12 +97,8 @@ void* android_dlopen_ext(const char* path, int flags, const android_dlextinfo* e
 
 static uintptr_t maps_find_lib_base(const char* lib_suffix);
 
-/* mprotect */
-static int (*real_mprotect)(void*, size_t, int) = NULL;
-static pthread_once_t mprotect_resolve_once = PTHREAD_ONCE_INIT;
-static void resolve_mprotect(void) {
-    real_mprotect = (int (*)(void*, size_t, int))dlsym(RTLD_NEXT, "mprotect");
-}
+/* mprotect: jnilog exports its own interposer (see below) that goes straight to
+ * the raw syscall, so no dlsym(RTLD_NEXT,"mprotect") resolution is needed. */
 
 typedef void* (*loader_dlopen_fn)(const char*, int, const void*);
 static loader_dlopen_fn orig_loader_dlopen = NULL;
@@ -180,15 +176,15 @@ static void* hooked_loader_android_dlopen_ext(const char* filename, int flags,
  * "lo-hi perms" fields are needed, so the 512-byte line cap is irrelevant here
  * (perms sit at the very start of the line). (F3) */
 static int page_prot_from_maps(uintptr_t addr) {
-    FILE* f = fopen("/proc/self/maps", "re");
-    if (!f) return -1;
+    jl_linereader lr;
+    if (jl_lr_open(&lr, "/proc/self/maps", O_RDONLY | O_CLOEXEC) < 0) return -1;
     char line[512];
     int prot = -1;
-    while (fgets(line, sizeof(line), f)) {
-        unsigned long lo = 0, hi = 0;   /* 64-bit on LP64 aarch64 — holds a full VA */
+    while (jl_lr_next(&lr, line, sizeof(line))) {
+        uintptr_t lo = 0, hi = 0;
         char perms[5] = {0};
-        if (sscanf(line, "%lx-%lx %4s", &lo, &hi, perms) == 3) {
-            if (addr >= (uintptr_t)lo && addr < (uintptr_t)hi) {
+        if (jl_parse_maps_head(line, &lo, &hi, perms)) {
+            if (addr >= lo && addr < hi) {
                 prot = 0;
                 if (perms[0] == 'r') prot |= PROT_READ;
                 if (perms[1] == 'w') prot |= PROT_WRITE;
@@ -197,7 +193,7 @@ static int page_prot_from_maps(uintptr_t addr) {
             }
         }
     }
-    fclose(f);
+    jl_lr_close(&lr);
     return prot;
 }
 
@@ -214,14 +210,14 @@ static void patch_got_slot(void** got_slot, void* new_fn, long page_size,
                            const char* what) {
     void* page = (void*)((uintptr_t)got_slot & ~((uintptr_t)page_size - 1));
     int orig_prot = page_prot_from_maps((uintptr_t)got_slot);
-    real_mprotect(page, (size_t)page_size, PROT_READ | PROT_WRITE);
+    jl_syscall3(__NR_mprotect, (long)page, (long)page_size, PROT_READ | PROT_WRITE);
     __atomic_store_n((uintptr_t*)got_slot, (uintptr_t)new_fn, __ATOMIC_RELEASE);
     if (orig_prot < 0) {
         LOG_DIRECT(ANDROID_LOG_WARN,
                    DL_TAG " GOT page perms unread for %s; restoring PROT_READ", what);
         orig_prot = PROT_READ;
     }
-    real_mprotect(page, (size_t)page_size, orig_prot);
+    jl_syscall3(__NR_mprotect, (long)page, (long)page_size, (long)orig_prot);
 }
 
 static void install_loader_dlopen_hook(void) {
@@ -270,16 +266,7 @@ static void install_loader_dlopen_hook(void) {
         return;
     }
 
-    pthread_once(&mprotect_resolve_once, resolve_mprotect);
-    if (!real_mprotect) {
-        LOG_DIRECT(ANDROID_LOG_WARN,
-                   DL_TAG " hook install skipped "
-                   DL_KEY("reason") C_YELLOW  "mprotect_unavailable" C_RESET " "
-                   DL_KEY("fn")     C_MAGENTA "real_mprotect" C_RESET);
-        return;
-    }
-
-    long page_size = sysconf(_SC_PAGESIZE);
+    long page_size = jl_page_size();
     if (page_size <= 0) page_size = 4096;
 
     size_t n = rela_plt_sz / sizeof(Elf64_Rela);
@@ -338,16 +325,15 @@ static void install_loader_dlopen_hook(void) {
 static __thread int g_in_mprotect_hook = 0;
 
 int mprotect(void* addr, size_t len, int prot) {
-    pthread_once(&mprotect_resolve_once, resolve_mprotect);
-    int (*real)(void*, size_t, int) = real_mprotect;
-    if (!real) {
-        /* dlsym(RTLD_NEXT,"mprotect") failed — fall back to the raw syscall so
-         * the host process's mprotect never silently breaks and errno is set by
-         * the kernel rather than left stale (the old `return -1` reported a
-         * bogus failure with whatever errno happened to hold). (F11) */
-        return (int)syscall(SYS_mprotect, addr, len, prot);
-    }
-    int result = real(addr, len, prot);
+    /* Always go straight to the kernel — bionic's mprotect is a thin syscall
+     * wrapper, so this is functionally identical while needing no dlsym to
+     * resolve a "real" mprotect. jl_syscall3 returns -errno without touching
+     * libc errno, so set errno to keep this exported interposer faithful to the
+     * libc ABI for its callers (incl. the Go runtime). (F11) */
+    long sr = jl_syscall3(__NR_mprotect, (long)addr, (long)len, (long)prot);
+    int result;
+    if (sr < 0) { errno = (int)(-sr); result = -1; }
+    else result = 0;
     /* Track newly-executable app regions for caller-range filtering, but never
      * re-entrantly (see g_in_mprotect_hook) and never letting this best-effort
      * bookkeeping change the syscall's result/errno for the caller. (F11) */
@@ -384,27 +370,24 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved);
 /* --- Helpers --- */
 
 static uintptr_t maps_find_lib_base(const char* lib_suffix) {
-    FILE* f = fopen("/proc/self/maps", "r");
-    if (!f) return 0;
-    /* getline so a long split-APK path isn't truncated at 512 B, which could
-     * hide the matching lib's line and make us miss its base (F12). */
-    char* line = NULL;
-    size_t line_cap = 0;
+    jl_linereader lr;
+    if (jl_lr_open(&lr, "/proc/self/maps", O_RDONLY | O_CLOEXEC) < 0) return 0;
+    /* 1 KB line buffer so a long split-APK path isn't truncated (which could
+     * hide the matching lib's line and make us miss its base). (F12) */
+    char line[1024];
     uintptr_t base = 0;
-    while (getline(&line, &line_cap, f) != -1) {
+    while (jl_lr_next(&lr, line, sizeof(line))) {
         char* path = strrchr(line, '/');
         if (!path) continue;
         char* nl = path + strlen(path) - 1;
         while (nl >= path && (*nl == '\n' || *nl == '\r' || *nl == ' ')) *nl-- = '\0';
         size_t sl = strlen(lib_suffix), pl = strlen(path);
         if (pl < sl || strcmp(path + pl - sl, lib_suffix) != 0) continue;
-        unsigned long lo = 0;
-        sscanf(line, "%lx", &lo);
-        base = (uintptr_t)lo;
+        const char* p = line;
+        base = (uintptr_t)jl_parse_hex(&p);
         break;
     }
-    free(line);
-    fclose(f);
+    jl_lr_close(&lr);
     return base;
 }
 
@@ -602,7 +585,17 @@ static void* constructor_init_worker(void* arg) {
 
 __attribute__((constructor)) void library_constructor(void) {
     LOG_DIRECT(ANDROID_LOG_INFO, "=== libjnilog constructor start (PID=%d) ===", getpid());
-    
+
+    /* Capture our own [base,end) NOW — synchronously, inside the constructor,
+     * which runs during dlopen while we are still mapped and BEFORE the injector
+     * vma-hides / soinfo-unlinks us, and before any exec-range seeding (the
+     * detached init worker, goBridgeInit, and the dlopen hooks all seed later).
+     * If this were deferred to the worker thread it could race vma_hide and lose
+     * our identity, which would let our own staged segment be seeded as an
+     * in-scope app range — and we would log every JNI call our formatter makes.
+     * Idempotent (guarded), so the later c_init_range_tracking call is a no-op. */
+    c_capture_self_range();
+
     const char* ld_preload = getenv("LD_PRELOAD");
     if (ld_preload && strstr(ld_preload, "jnilog")) {
         init_once_handler();

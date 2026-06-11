@@ -304,6 +304,11 @@ int c_has_exec_ranges(void);
 int c_should_try_seed(void);
 void c_reset_seed_attempted(void);
 int c_seed_exec_ranges_from_maps(void);
+/* Self-exclusion: capture our own [base,end) once at init (by identity, before
+ * the injector vma-hides/unlinks us); c_is_self_addr answers "is this caller our
+ * own payload code?" on the hot path. See rangeset.c. */
+void c_capture_self_range(void);
+int c_is_self_addr(uintptr_t addr);
 
 #ifdef __cplusplus
 }

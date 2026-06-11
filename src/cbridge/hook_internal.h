@@ -164,8 +164,11 @@ void log_method_return_void(JNIEnv *env, const method_log_ctx_t *ctx,
 void field_log_ctx_init(field_log_ctx_t *ctx);
 void field_log_ctx_destroy(field_log_ctx_t *ctx);
 
+/* is_static: when set and the field's declaring class resolves, the receiver is
+ * labelled with that class name (static fields) instead of deferred-rendering
+ * the jclass (which renders to empty). */
 void prepare_field_log_ctx(field_log_ctx_t *ctx, JNIEnv *env, void *receiver,
-                           jfieldID field_id, void *caller);
+                           jfieldID field_id, void *caller, int is_static);
 
 /*
  * emit_field_access_begin — for Set* operations (value known before the call).

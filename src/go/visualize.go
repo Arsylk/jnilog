@@ -28,7 +28,7 @@ func visClassName(ptr uintptr) string {
 		return ""
 	}
 	result := C.GoString(cstr)
-	C.free(unsafe.Pointer(cstr))
+	C.c_free_cstr(unsafe.Pointer(cstr))
 	return result
 }
 
@@ -46,6 +46,6 @@ func visObjectClassName(ptr uintptr) string {
 		return ""
 	}
 	result := C.GoString(cstr)
-	C.free(unsafe.Pointer(cstr))
+	C.c_free_cstr(unsafe.Pointer(cstr))
 	return result
 }

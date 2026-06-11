@@ -20,18 +20,6 @@ static inline void go_logcat_write(int priority, const char* message) {
 }
 #endif
 
-#ifndef JNI_LOG_GET_TID_DEFINED
-#define JNI_LOG_GET_TID_DEFINED
-#include <sys/types.h>
-#include <unistd.h>
-#include <sys/syscall.h>
-
-// Use gettid() which is available in Android's unistd.h
-static inline int jni_log_get_tid() {
-  return (int)gettid();
-}
-#endif
-
 #ifndef __ANDROID__
 
   static inline void go_logcat_write(int priority, const char* message) {

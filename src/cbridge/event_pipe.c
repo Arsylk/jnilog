@@ -20,7 +20,6 @@
 #include "event_pipe.h"
 #include "visualize.h"
 
-#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -243,8 +242,9 @@ static size_t put_header(uint8_t *buf,
 int event_pipe_init(void) {
     if (g_writer_fd >= 0) return 0;     /* idempotent */
     int sv[2];
-    if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sv) != 0) {
-        return -errno;
+    int sp = socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sv);
+    if (sp != 0) {
+        return sp; /* jl_socketpair already returns -errno */
     }
     /* Writer non-blocking — never stall the JNI hook on backpressure. */
     int flags = fcntl(sv[0], F_GETFL, 0);
@@ -270,6 +270,12 @@ int event_pipe_init(void) {
 }
 
 int event_pipe_consumer_fd(void) { return g_reader_fd; }
+
+/* Free a bridge-allocated C string handed to Go. `free` is redirected to the
+ * in-tree allocator (jl_free) in the unity build, matching the jl_malloc/
+ * jl_strdup these strings came from. Go calls this (C.c_free_cstr) instead of
+ * C.free for results from vis_* and event_pipe_render_obj. */
+void c_free_cstr(void *p) { free(p); }
 
 /* ── send helper ────────────────────────────────────────────────────── */
 static int send_record(const uint8_t *buf, size_t len) {
@@ -386,9 +392,14 @@ int event_pipe_emit_field_access(
     uint8_t buf[EVENT_MAX_BYTES];
     /* Pack receiver_kind in the "receiver_kind" header byte and value_kind in
      * the "ret_kind" byte. value_raw goes in the mid_or_raw slot. */
+    /* nstrings MUST equal the number of append_str() calls below (7): the Go
+     * consumer reads this count from the header and the evFieldAccess case
+     * requires exactly 7 strings — a wrong count makes it silently drop EVERY
+     * field-access event (name, receiver_str, receiver_extra, field_name,
+     * value_str, value_extra, caller). */
     size_t pos = put_header(buf, EV_FIELD_ACCESS,
                             (uint8_t)receiver_kind, (uint8_t)value_kind,
-                            /* nstrings = */ 6,
+                            /* nstrings = */ 7,
                             offset, 0, (uint64_t)value_raw);
     if (append_str(buf, &pos, sizeof(buf), name)            ||
         append_str(buf, &pos, sizeof(buf), receiver_str)    ||

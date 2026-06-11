@@ -316,10 +316,16 @@ void log_jni_register_natives(
     for (int i = 0; i < n_methods; i++) {
         if (i > 0) REGNAT_APPEND("%s", ", ");
         if (pos + 1 >= sizeof(buf)) break;
-        REGNAT_APPEND("%.200s %.400s @%p",
+        /* Symbolize the native fn pointer to "lib.so!0xoffset" exactly like a
+         * caller return address (address_of_r → private maps/.dynsym walk). The
+         * lib-relative offset is stable across runs (unlike the ASLR'd raw
+         * pointer) and points straight at the registered implementation. */
+        char fnsym[192];
+        address_of_r(methods[i].fnPtr, fnsym, sizeof(fnsym));
+        REGNAT_APPEND("%.200s %.400s @%s",
                       methods[i].name      ? methods[i].name      : "?",
                       methods[i].signature ? methods[i].signature : "?",
-                      methods[i].fnPtr);
+                      fnsym);
         if (pos + 1 >= sizeof(buf)) break;
     }
 #undef REGNAT_APPEND

@@ -144,6 +144,12 @@ func (f lineFormatter) formatOffset(_ int) string { return "" }
 func (f lineFormatter) formatArrow() string    { return f.colorize(ansiBlue, "→") }
 func (f lineFormatter) formatSetArrow() string { return f.colorize(ansiBlue, "←") }
 
+// callIDBadge renders the atomic call_id that links a CALL line to its RETURN
+// line (they are emitted as two separate records). Same id on both.
+func (f lineFormatter) callIDBadge(id uint64) string {
+	return f.colorize(ansiSubtle, "#"+strconv.FormatUint(id, 16))
+}
+
 // ============================================================================
 // Type-directed value formatting — the core of the redesign.
 //
@@ -466,7 +472,11 @@ func (f lineFormatter) formatMethodFieldID(id uintptr) string {
 }
 
 // formatAddress renders a caller return address in dim style.
-// Formats: library!symbol+0xNN, library!0xNN, library!symbol, raw 0xNN
+// Formats: library!symbol+0xNN, library!0xNN, library!symbol, raw 0xNN.
+// The C symbolizer emits a "library+0xNN" wire form for an address in the
+// library's in-memory/decrypted region (packer .bss / JIT, past its file image);
+// we render it with the same "library!offset" structure as the on-disk form but
+// a YELLOW "!" (vs the on-disk PINK "!") as the at-a-glance tell.
 func (f lineFormatter) formatAddress(caller string) string {
 	if caller == "" {
 		return ""
@@ -486,6 +496,12 @@ func (f lineFormatter) formatAddress(caller string) string {
 			// library!symbol (offset is zero, no suffix)
 			res += f.colorize(ansiBlue, after)
 		}
+	} else if plus := strings.SplitN(caller, "+0x", 2); len(plus) == 2 {
+		// library+0xNN wire form → in-memory/decrypted code (packer .bss / JIT),
+		// not on disk. Keep the project's "library!offset" structure (lavender
+		// lib, orange offset); the "!" is YELLOW (vs the on-disk PINK "!") as the
+		// at-a-glance tell that the offset is into the runtime image, not the file.
+		res += f.colorize(ansiLavender, plus[0]) + f.colorize(ansiYellow, "!") + f.colorize(ansiOrange, "0x"+plus[1])
 	} else if strings.HasPrefix(caller, "0x") || strings.HasPrefix(caller, "0X") {
 		// Raw hex address (no library resolved)
 		res += f.colorize(ansiOrange, strings.ToLower(caller))
@@ -511,7 +527,7 @@ func (f lineFormatter) formatType(name string) string {
 // ============================================================================
 
 // emitCallFull renders a complete method call + return as one log line.
-func emitCallFull(offset int, frame *callFrame, result JNIValue) {
+func emitCallFull(offset int, frame *callFrame, result JNIValue, id uint64) {
 	// Gate 3: regex blacklist (skip before any formatting work)
 	if configSignatureBlacklisted(frame.callKey()) {
 		return
@@ -522,7 +538,7 @@ func emitCallFull(offset int, frame *callFrame, result JNIValue) {
 		return
 	}
 
-	methodTag := f.dim("[" + frame.jniName + "]")
+	methodTag := f.dim("[" + frame.jniName + "]") + " " + f.callIDBadge(id)
 
 	var receiverStr string
 	if frame.receiver.Kind != KindNull && frame.receiver.Kind != KindVoid {
@@ -555,28 +571,27 @@ func emitCallFull(offset int, frame *callFrame, result JNIValue) {
 		prettyCall = f.formatPrettyCallTyped(frame.className, frame.methodName, frame.args)
 	}
 
-	resultStr := f.formatJNIValue(result)
+	// CALL line: receiver + args + caller. Always emitted. The return value is
+	// NOT here — it goes on its own RETURN line below, linked by the #id badge,
+	// so neither line runs unreadably long and a call that never returns (crash
+	// or hang) is still visible.
+	writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s %s",
+		f.formatOffset(offset),
+		methodTag,
+		receiverStr,
+		prettyCall,
+		f.formatAddress(frame.caller),
+	))
 
-	// Void-returning calls (Release*, Delete*, SetObjectArrayElement,
-	// CallVoidMethod, ExceptionClear, etc.) don't need "→ void" —
-	// the side effect is the point, not the return value.
+	// RETURN line: the typed return value, same #id. Void-returning calls
+	// (Release*, Delete*, CallVoidMethod, ExceptionClear, …) carry no payload —
+	// the call line alone is the event, so no return line is emitted.
 	if result.Kind != KindVoid {
-		writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s %s %s %s",
+		writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s",
 			f.formatOffset(offset),
 			methodTag,
-			receiverStr,
-			prettyCall,
 			f.formatArrow(),
-			resultStr,
-			f.formatAddress(frame.caller),
-		))
-	} else {
-		writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s %s",
-			f.formatOffset(offset),
-			methodTag,
-			receiverStr,
-			prettyCall,
-			f.formatAddress(frame.caller),
+			f.formatJNIValue(result),
 		))
 	}
 }
@@ -584,14 +599,14 @@ func emitCallFull(offset int, frame *callFrame, result JNIValue) {
 // emitStandaloneReturn renders a return-only line for the no-frame-tracking
 // design (see goJNIReturnCallback comment in main.go).  Void returns are
 // suppressed — they carry no payload to display.
-func emitStandaloneReturn(offset int, name string, result JNIValue) {
+func emitStandaloneReturn(offset int, name string, result JNIValue, id uint64) {
 	if configSignatureBlacklisted(name) {
 		return
 	}
 	if result.Kind == KindVoid {
 		return
 	}
-	methodTag := f.dim("[" + name + "]")
+	methodTag := f.dim("[" + name + "]") + " " + f.callIDBadge(id)
 	writeLine(logLevelInfo, fmt.Sprintf("%s%s %s %s",
 		f.formatOffset(offset),
 		methodTag,

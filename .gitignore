@@ -38,3 +38,12 @@ mlog.txt
 # Amazon Kiro IDE specs / steering — local-only by default.
 # Remove this line if you want to track .kiro/ deliberately.
 .kiro/
+
+# jnilogcfg default write target at repo root (docs/jnilog.json is the tracked example)
+/jnilog.json
+
+# Compiled jnilogcfg binary (built by `xmake cfgbuild` / local `go build`)
+/tools/jnilogcfg/jnilogcfg
+
+# Stray local screen recording
+/rec.gif

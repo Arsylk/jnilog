@@ -1111,23 +1111,21 @@ void hooked_FatalError(JNIEnv *env, const char *msg) {
 jboolean hooked_ExceptionCheck(JNIEnv *env) {
   void *caller = __builtin_return_address(0);
   jboolean res = g_original_jni_table->ExceptionCheck(env);
-  if (!is_reentrant_call() && should_log_from_caller(env, caller)) {
+  /* Only emit when an exception is actually pending. Callers poll
+   * ExceptionCheck constantly, so the res==false case is pure noise (it was
+   * ~35% of all events); suppressing it leaves only the meaningful "an
+   * exception is live" lines, which carry the resolved exception object. */
+  if (res && !is_reentrant_call() && should_log_from_caller(env, caller)) {
     set_reentrant_call(1);
     char cs[192]; address_of_r(caller, cs, sizeof(cs));
-    if (res) {
-      /* Encode 'true' as call arg, then resolve the exception object as return value. */
-      char enc[32];
-      snprintf(enc, sizeof(enc), "Z\x01%d\x02", (int)res);
-      log_jni_call(JNI_SLOT(ExceptionCheck), "ExceptionCheck",
-                   WIRE_KIND_NULL, "", "", "", "ExceptionCheck", enc, 0, cs);
-      jthrowable exc = g_original_jni_table->ExceptionOccurred(env);
-      _log_obj_ret(JNI_SLOT(ExceptionCheck), "ExceptionCheck", env, exc);
-      if (exc) g_original_jni_table->DeleteLocalRef(env, exc);
-    } else {
-      log_jni_call(JNI_SLOT(ExceptionCheck), "ExceptionCheck",
-                   WIRE_KIND_NULL, "", "", "", "ExceptionCheck", "", 0, cs);
-      LOG_BOOL_RET(ExceptionCheck, "ExceptionCheck", res);
-    }
+    /* Encode 'true' as call arg, then resolve the exception object as return value. */
+    char enc[32];
+    snprintf(enc, sizeof(enc), "Z\x01%d\x02", (int)res);
+    log_jni_call(JNI_SLOT(ExceptionCheck), "ExceptionCheck",
+                 WIRE_KIND_NULL, "", "", "", "ExceptionCheck", enc, 0, cs);
+    jthrowable exc = g_original_jni_table->ExceptionOccurred(env);
+    _log_obj_ret(JNI_SLOT(ExceptionCheck), "ExceptionCheck", env, exc);
+    if (exc) g_original_jni_table->DeleteLocalRef(env, exc);
     set_reentrant_call(0);
   }
   return res;

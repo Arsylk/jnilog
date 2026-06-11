@@ -169,4 +169,10 @@ int  event_pipe_emit_register_natives(
         uintptr_t clazz,
         const char *class_name, const char *methods, const char *caller);
 
+/* Release a C string that a bridge function (event_pipe_render_obj, vis_*)
+ * returned to Go. The bridge's heap is the in-tree allocator (freestanding/
+ * jl_alloc.h), so these MUST be freed through here (-> jl_free), never Go's
+ * C.free (libc). C.CString-allocated pointers are libc and still use C.free. */
+void c_free_cstr(void *p);
+
 #endif /* JNILOG_EVENT_PIPE_H */
