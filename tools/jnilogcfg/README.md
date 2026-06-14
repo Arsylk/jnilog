@@ -25,7 +25,7 @@ xmake cfgbuild      # builds the host binary into dist/jnilogcfg
 | key      | action                                              |
 |----------|-----------------------------------------------------|
 | `↑`/`↓`  | move between rows                                   |
-| `space`  | category: cycle **off → include → exclude → off**; `include fns`/`exclude fns`: open the function picker; `array_items`/`regex`: edit |
+| `space`  | category: cycle **off → include → exclude → off**; `include fns`/`exclude fns`: open the function picker; `array_items`: edit; `excl. regex`: open regex list editor |
 | `enter`  | same as space (also commits an edit)                |
 | `←`/`→`  | adjust `array_items` (also `-`/`+`)                 |
 | `s`      | save to the file                                    |
@@ -53,6 +53,39 @@ as the `functions` (whitelist) or `exclude.functions` (blacklist) list.
 
 A live JSON preview of exactly what will be written is shown at all times,
 along with the effective mode (all-minus-excludes vs whitelist).
+
+### regex list editor (excl. regex)
+
+`excl. regex` opens a **multi-line list editor** where each line is one regex
+pattern with a **live format hint** describing what parts of the call key it
+targets. The call key format is:
+
+    FunctionName|ClassName::methodName(type1, type2, ...)
+
+| key      | action inside the regex editor                       |
+|----------|------------------------------------------------------|
+| `↑`/`↓`  | move between patterns                                |
+| `enter`  | edit the selected pattern (opens inline text input)  |
+| `a`      | append a new blank pattern                           |
+| `d`      | delete the selected pattern                          |
+| `esc`    | commit all changes and return to the main view       |
+
+#### Format hints
+
+Each pattern gets an automatic, color-coded hint:
+
+| Pattern                         | Hint                                 |
+|---------------------------------|--------------------------------------|
+| `DeleteLocalRef`                | `fn:DeleteLocalRef`                  |
+| `Call.*`                        | `fn:Call*`                           |
+| `\|.*MyClass::`                 | `class/method context · method`      |
+| `\|.*MyClass::doSomething\(`   | `class/method context · method · args`|
+| `\.MyClass`                    | `class name`                         |
+| `FindClass\|.*SomeClass`       | `fn:FindClass · class/method context` |
+| *(empty)*                       | `empty — matches nothing`            |
+| *(invalid regex)*               | `invalid regex` (shown in red)       |
+
+Invalid patterns are highlighted in red so you catch syntax errors at a glance.
 
 ## CLI (non-interactive)
 

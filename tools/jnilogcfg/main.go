@@ -10,9 +10,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -66,11 +68,335 @@ var (
 	stErr     = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8"))
 	stPreview = lipgloss.NewStyle().Foreground(lipgloss.Color("#94e2d5"))
 	stRule    = lipgloss.NewStyle().Foreground(lipgloss.Color("#313244"))
+	stHint    = lipgloss.NewStyle().Foreground(lipgloss.Color("#f5c2e7"))
 	stBar     = lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder(), false, false, false, true).
 			BorderForeground(lipgloss.Color("#45475a")).
 			PaddingLeft(1)
+	stCarousel = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder(), true, true, true, true).
+			BorderForeground(lipgloss.Color("#585b70")).
+			Padding(0, 2)
+	stCarHead = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#fab387"))
+	stCarPat  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f5e0dc"))
+	stCarYes  = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1"))
+	stCarNo   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8"))
+	stCarPage = lipgloss.NewStyle().Italic(true).Foreground(lipgloss.Color("#585b70"))
 )
+
+// ── call-key format hints ─────────────────────────────────────────────────
+
+// callKeyHint returns a short string describing what parts of a call key the
+// given regex pattern targets.  The call key format is:
+//
+//	JniFunctionName|ClassName::methodName(type1, type2, ...)
+//
+// For field access:
+//
+//	JniFunctionName|ClassName.fieldName: type
+func callKeyHint(pat string) string {
+	if pat == "" {
+		return "empty — matches nothing"
+	}
+
+	// Try to compile; if it fails we just show (invalid) instead of crashing.
+	_, err := regexp.Compile(pat)
+	if err != nil {
+		return "invalid regex"
+	}
+
+	// Decompose the pattern into which parts of the call-key it targets.
+	var tags []string
+
+	// Does it target a specific JNI function name?  Check the full pattern
+	// (bare identifier or anchored glob), or extract it from before a pipe.
+	if fn := extractJniFnRef(pat); fn != "" {
+		tags = append(tags, "fn:"+shortenFnRef(fn))
+	}
+
+	// Pipe = targets class-or-method context (the "|ClassName::methodName" part).
+	if containsPipe(pat) {
+		tags = append(tags, "class/method context")
+		// "::" means it also targets a specific method name.
+		if strings.Contains(pat, "::") {
+			tags = append(tags, "method")
+		}
+		// Parentheses mean argument types are also matched (escape-aware).
+		if strings.Contains(pat, `\(`) {
+			tags = append(tags, "args")
+		}
+	}
+
+	// Matches class names even without a pipe (e.g. "\bMyClass\b").
+	if hasPackageLike(pat) {
+		tags = append(tags, "class name")
+	}
+
+	switch {
+	case len(tags) == 0:
+		return "generic — tested against full call key"
+	case len(tags) == 1 && strings.HasPrefix(tags[0], "fn:"):
+		return tags[0]
+	default:
+		return strings.Join(tags, " · ")
+	}
+}
+
+// extractJniFnRef extracts a JNI function name reference from the pattern,
+// or returns "" if nothing looks like one.  Handles bare identifiers,
+// anchored globs like "^Call.*", and prefix-before-pipe like "CallIntMethod|".
+func extractJniFnRef(pat string) string {
+	// Try the part before any pipe first — patterns like "CallIntMethod|...".
+	prefix := pat
+	if idx := strings.Index(pat, "|"); idx >= 0 {
+		prefix = pat[:idx]
+	}
+	p := strings.TrimPrefix(prefix, "^")
+	p = strings.TrimSuffix(p, "$")
+	if p == "" {
+		return ""
+	}
+	// Must start with uppercase.
+	if p[0] < 'A' || p[0] > 'Z' {
+		return ""
+	}
+	// Plain uppercase-starting identifier (no metachars) is always a JNI ref.
+	if isPlainAlpha(p) {
+		return p
+	}
+	// Otherwise, test if it's an anchor glob like "^Call.*" or "Call[A-Z].*".
+	if isJniAnchorGlob(p) {
+		return p
+	}
+	return ""
+}
+
+// isPlainAlpha returns true if s is non-empty and contains only letters.
+func isPlainAlpha(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z')) {
+			return false
+		}
+	}
+	return true
+}
+
+// isJniAnchorGlob returns true for patterns like "^Call.*" or "Call[A-Z].*"
+// that start with an uppercase letter followed by a regex-like pattern that
+// still clearly references a JNI function name.
+func isJniAnchorGlob(p string) bool {
+	// Strip anchors — we already did above, but be safe.
+	p = strings.TrimPrefix(p, "^")
+	p = strings.TrimSuffix(p, "$")
+	if p == "" || !(p[0] >= 'A' && p[0] <= 'Z') {
+		return false
+	}
+	// Strip common JNI-function-pattern metacharacters.
+	// "Call[A-Z].*" → after stripping .* and [A-Z] ranges → "Call".
+	clean := stripJniGlobMetas(p)
+	for _, r := range clean {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// stripJniGlobMetas removes regex metacharacters commonly used in JNI-name
+// patterns: . * [ ] - plus backslash-escapes.
+func stripJniGlobMetas(s string) string {
+	s = strings.ReplaceAll(s, ".*", "")
+	s = strings.ReplaceAll(s, ".", "")
+	s = strings.ReplaceAll(s, "*", "")
+	s = strings.ReplaceAll(s, "[", "")
+	s = strings.ReplaceAll(s, "]", "")
+	s = strings.ReplaceAll(s, "-", "")
+	s = strings.ReplaceAll(s, "\\", "")
+	return s
+}
+
+// shortenFnRef extracts a short readable reference from a function-name pattern.
+func shortenFnRef(pat string) string {
+	p := strings.TrimPrefix(pat, "^")
+	p = strings.TrimSuffix(p, "$")
+	// Replace ".*" with "*" for display
+	p = strings.ReplaceAll(p, ".*", "*")
+	// Remove escape backslashes for display
+	p = strings.ReplaceAll(p, "\\.", ".")
+	return p
+}
+
+// containsPipe reports whether the pattern targets the class/method portion
+// of a call key (anything after the pipe separator).
+func containsPipe(pat string) bool {
+	// Look for an unescaped pipe
+	for i := 0; i < len(pat); i++ {
+		if pat[i] == '\\' {
+			i++ // skip next char
+			continue
+		}
+		if pat[i] == '|' {
+			return true
+		}
+	}
+	// Also check for | class/method indicators via hex or indirect pipes
+	if strings.Contains(pat, `\|`) {
+		return true
+	}
+	return false
+}
+
+// hasPackageLike checks if the pattern contains dotted package-like segments
+// separated by escaped dots — a strong class-name signal even without a pipe.
+func hasPackageLike(pat string) bool {
+	// Look for patterns like `com\.` or `java\.` — package prefixes.
+	return strings.Contains(pat, `\.`)
+}
+
+// ── regex carousel examples ───────────────────────────────────────────────
+
+// regexExample is a single carousel entry demonstrating a practical pattern,
+// what call keys it matches, and what keys it intentionally skips.
+type regexExample struct {
+	pattern string
+	hint    string
+	matches []string
+	skips   []string
+}
+
+// regexExamples is a curated collection of patterns that span the full
+// expressiveness of the call-key format — from narrow exact-match to broad
+// wildcards, anchored JNI names, specific classes/methods, alternation, and
+// package-name targeting.
+var regexExamples = []regexExample{
+	{
+		pattern: `^CallIntMethod`,
+		hint:    "exact JNI function, anchored at start",
+		matches: []string{
+			`CallIntMethod|com.Foo::bar(int)`,
+			`CallIntMethod|com.Foo::baz(java.lang.String)`,
+		},
+		skips: []string{
+			`CallVoidMethod|com.Foo::bar()`,
+			`CallBooleanMethod|com.Foo::check()`,
+		},
+	},
+	{
+		pattern: `Set.*Field`,
+		hint:    "any Set*Field call (field writes)",
+		matches: []string{
+			`SetIntField|com.Foo::x(int)`,
+			`SetObjectField|com.Foo::ref(java.lang.Object)`,
+		},
+		skips: []string{
+			`GetIntField|com.Foo::x(int)`,
+			`CallIntMethod|com.Foo::setX()`,
+		},
+	},
+	{
+		pattern: `\|.*MyActivity`,
+		hint:    "any call touching a specific class",
+		matches: []string{
+			`CallVoidMethod|com.app.MyActivity::onCreate(android.os.Bundle)`,
+			`FindClass|com.app.MyActivity`,
+		},
+		skips: []string{
+			`CallVoidMethod|com.app.OtherActivity::onCreate(android.os.Bundle)`,
+			`FindClass|com.app.MyFragment`,
+		},
+	},
+	{
+		pattern: `::onClick`,
+		hint:    "a specific method name on any class",
+		matches: []string{
+			`CallVoidMethod|android.view.View::onClick(android.view.View)`,
+			`CallBooleanMethod|com.app.CustomBtn::onClick(android.view.View)`,
+		},
+		skips: []string{
+			`CallVoidMethod|android.view.View::onCreate(android.os.Bundle)`,
+			`CallVoidMethod|android.view.View::onLongClick(android.view.View)`,
+		},
+	},
+	{
+		pattern: `FindClass\|`,
+		hint:    "class lookups by JNI name + pipe anchor",
+		matches: []string{
+			`FindClass|java.lang.String`,
+			`FindClass|com.app.SecretService`,
+		},
+		skips: []string{
+			`NewString|java.lang.String`,
+			`CallVoidMethod|com.app.SecretService::run()`,
+		},
+	},
+	{
+		pattern: `(DeleteLocalRef|DeleteGlobalRef)`,
+		hint:    "multiple related JNI functions (alternation)",
+		matches: []string{
+			`DeleteLocalRef|`,
+			`DeleteGlobalRef|`,
+		},
+		skips: []string{
+			`NewGlobalRef|`,
+			`NewLocalRef|`,
+		},
+	},
+	{
+		pattern: `Call.*Method\|.*::getInstance`,
+		hint:    "JNI fn group + specific method name",
+		matches: []string{
+			`CallObjectMethod|com.app.Singleton::getInstance()`,
+			`CallStaticObjectMethod|com.app.Factory::getInstance(android.content.Context)`,
+		},
+		skips: []string{
+			`CallObjectMethod|com.app.Singleton::getInstance(int)`,
+			`CallObjectMethod|com.app.Singleton::getSystemService(java.lang.String)`,
+		},
+	},
+	{
+		pattern: `NewString`,
+		hint:    "all string-creation JNI calls",
+		matches: []string{
+			`NewString|java.lang.String(abc)`,
+			`NewStringUTF|java.lang.String(def)`,
+		},
+		skips: []string{
+			`GetStringChars|java.lang.String(abc)`,
+			`NewObject|java.lang.StringBuilder`,
+		},
+	},
+	{
+		pattern: `Throw`,
+		hint:    "exception-related calls",
+		matches: []string{
+			`Throw|`,
+			`ThrowNew|java.lang.Exception(msg)`,
+		},
+		skips: []string{
+			`ExceptionCheck|()`,
+			`ExceptionClear|`,
+		},
+	},
+	{
+		pattern: `com\\.example\\.`,
+		hint:    "all calls in a package namespace",
+		matches: []string{
+			`FindClass|com.example.Foo`,
+			`CallIntMethod|com.example.Bar::run(int)`,
+		},
+		skips: []string{
+			`FindClass|com.other.Foo`,
+			`CallIntMethod|org.whatever.Bar::run(int)`,
+		},
+	},
+}
+
+// regexCarouselTickMsg fires every 5s to advance the carousel.
+type regexCarouselTickMsg struct{}
 
 // ── model ──────────────────────────────────────────────────────────────────
 
@@ -96,6 +422,16 @@ type model struct {
 	pickInput  textinput.Model
 	pickSel    map[string]bool
 	pickCursor int
+
+	// regex list editor — each line is one pattern, multi-select with hints
+	regexEditing bool
+	regexList    []string
+	regexCursor  int
+	regexInput   textinput.Model
+	regexLineIdx int // -1 = not editing a specific line
+
+	// carousel that cycles thru example patterns in the regex editor
+	regexCarouselIdx int
 
 	width     int
 	status    string
@@ -137,9 +473,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case regexCarouselTickMsg:
+		if m.regexEditing {
+			return m.updateRegexEditor(msg)
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		if m.picking {
 			return m.updatePicker(msg)
+		}
+		if m.regexEditing {
+			return m.updateRegexEditor(msg)
 		}
 		if m.editing {
 			return m.updateEditing(msg)
@@ -189,7 +534,7 @@ func (m model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // activate toggles a category, opens the function picker, or opens the inline
-// editor (array_items / regex).
+// editor (array_items) / regex list editor.
 func (m model) activate() (tea.Model, tea.Cmd) {
 	r := m.rows[m.cursor]
 	switch r.kind {
@@ -198,19 +543,17 @@ func (m model) activate() (tea.Model, tea.Cmd) {
 		return m, nil
 	case rowIncludeFns, rowExcludeFns:
 		return m.openPicker(r.kind)
-	default:
+	case rowArrayItems:
 		m.editing = true
 		m.editTarget = r.kind
-		switch r.kind {
-		case rowArrayItems:
-			m.input.SetValue(strconv.Itoa(m.cs.arrayItems))
-		case rowExcludeRegex:
-			m.input.SetValue(joinCSV(m.cs.excludeRegex))
-		}
+		m.input.SetValue(strconv.Itoa(m.cs.arrayItems))
 		m.input.CursorEnd()
 		m.input.Focus()
 		return m, textinput.Blink
+	case rowExcludeRegex:
+		return m.openRegexEditor()
 	}
+	return m, nil
 }
 
 func (m model) updateEditing(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -226,8 +569,6 @@ func (m model) updateEditing(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if n, err := strconv.Atoi(trim(v)); err == nil && n >= 0 {
 				m.cs.arrayItems = n
 			}
-		case rowExcludeRegex:
-			m.cs.excludeRegex = parseCSV(v)
 		}
 		m.editing = false
 		m.input.Blur()
@@ -352,6 +693,166 @@ func (m *model) commitPicker() {
 	}
 }
 
+// ── regex list editor ──────────────────────────────────────────────────────
+
+// openRegexEditor enters the multi-line regex list editor view, where each
+// line is one exclude regex pattern with a format hint.
+func (m model) openRegexEditor() (tea.Model, tea.Cmd) {
+	m.regexEditing = true
+	// Copy the current list; ensure at least one empty slot.
+	m.regexList = append([]string(nil), m.cs.excludeRegex...)
+	if len(m.regexList) == 0 {
+		m.regexList = []string{""}
+	}
+	m.regexCursor = 0
+	m.regexLineIdx = -1
+	m.regexCarouselIdx = 0
+	ti := textinput.New()
+	ti.Prompt = "› "
+	ti.CharLimit = 4096
+	m.regexInput = ti
+	return m, m.regexCarouselTick()
+}
+
+// regexCarouselTick returns a tea.Cmd that fires regexCarouselTickMsg after 5s.
+func (m model) regexCarouselTick() tea.Cmd {
+	return tea.Tick(5*time.Second, func(t time.Time) tea.Msg {
+		return regexCarouselTickMsg{}
+	})
+}
+
+// commitRegexEditor writes the regex list back to the config state (filtering
+// out empty lines).
+func (m *model) commitRegexEditor() {
+	var out []string
+	for _, pat := range m.regexList {
+		if strings.TrimSpace(pat) != "" {
+			out = append(out, strings.TrimSpace(pat))
+		}
+	}
+	m.cs.excludeRegex = out
+}
+
+func (m model) updateRegexEditor(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Handle carousel tick first — advance and re-schedule.
+	if _, ok := msg.(regexCarouselTickMsg); ok {
+		m.regexCarouselIdx = (m.regexCarouselIdx + 1) % len(regexExamples)
+		return m, m.regexCarouselTick()
+	}
+
+	keyMsg, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+
+	// If we're editing a specific line, route keystrokes to the line editor.
+	if m.regexLineIdx >= 0 {
+		return m.updateRegexLineEdit(keyMsg)
+	}
+
+	switch keyMsg.String() {
+	case "esc", "ctrl+c":
+		m.commitRegexEditor()
+		m.regexEditing = false
+		return m, nil
+
+	case "up", "k":
+		if m.regexCursor > 0 {
+			m.regexCursor--
+		}
+		return m, nil
+
+	case "down", "j":
+		if m.regexCursor < len(m.regexList) {
+			m.regexCursor++
+		}
+		return m, nil
+
+	case "[":
+		// Previous carousel example.
+		m.regexCarouselIdx = (m.regexCarouselIdx - 1 + len(regexExamples)) % len(regexExamples)
+		return m, m.regexCarouselTick()
+
+	case "]":
+		// Next carousel example.
+		m.regexCarouselIdx = (m.regexCarouselIdx + 1) % len(regexExamples)
+		return m, m.regexCarouselTick()
+
+	case "enter":
+		// Enter on the "add new" slot → insert a blank line and edit it.
+		if m.regexCursor >= len(m.regexList) {
+			m.regexList = append(m.regexList, "")
+		}
+		m.regexLineIdx = m.regexCursor
+		if m.regexCursor >= 0 && m.regexCursor < len(m.regexList) {
+			m.regexInput.SetValue(m.regexList[m.regexCursor])
+		}
+		m.regexInput.CursorEnd()
+		m.regexInput.Focus()
+		return m, textinput.Blink
+
+	case "d", "D", "ctrl+d", "x":
+		// Delete the selected pattern (only if it's a real entry).
+		if m.regexCursor >= 0 && m.regexCursor < len(m.regexList) {
+			m.regexList = append(m.regexList[:m.regexCursor], m.regexList[m.regexCursor+1:]...)
+			if m.regexCursor >= len(m.regexList) && m.regexCursor > 0 {
+				m.regexCursor--
+			}
+			// Ensure at least one slot remains.
+			if len(m.regexList) == 0 {
+				m.regexList = []string{""}
+			}
+		}
+		return m, nil
+
+	case "a", "A", "ctrl+a":
+		// Append a new blank pattern and start editing it.
+		m.regexList = append(m.regexList, "")
+		m.regexCursor = len(m.regexList) - 1
+		m.regexLineIdx = m.regexCursor
+		m.regexInput.SetValue("")
+		m.regexInput.CursorEnd()
+		m.regexInput.Focus()
+		return m, textinput.Blink
+	}
+
+	return m, nil
+}
+
+// updateRegexLineEdit handles editing a single line (opened via enter).
+func (m model) updateRegexLineEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		// Cancel edit of this line — restore original value.
+		m.regexLineIdx = -1
+		m.regexInput.Blur()
+		return m, nil
+
+	case "enter":
+		// Commit edit of this line.
+		if m.regexLineIdx >= 0 && m.regexLineIdx < len(m.regexList) {
+			m.regexList[m.regexLineIdx] = m.regexInput.Value()
+			// If this was the last line and it's non-empty, add a new empty slot.
+			if m.regexLineIdx == len(m.regexList)-1 && strings.TrimSpace(m.regexInput.Value()) != "" {
+				m.regexList = append(m.regexList, "")
+				m.regexCursor = m.regexLineIdx + 1
+			} else {
+				m.regexCursor = m.regexLineIdx + 1
+				if m.regexCursor >= len(m.regexList) {
+					m.regexList = append(m.regexList, "")
+					m.regexCursor = len(m.regexList) - 1
+				}
+			}
+		}
+		m.regexLineIdx = -1
+		m.regexInput.Blur()
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.regexInput, cmd = m.regexInput.Update(msg)
+	return m, cmd
+}
+
 func (m model) pushCmd() tea.Cmd {
 	path, serial, cs := m.path, m.serial, m.cs
 	return func() tea.Msg {
@@ -385,6 +886,9 @@ func (m model) dividerWidth() int {
 func (m model) View() string {
 	if m.picking {
 		return m.viewPicker()
+	}
+	if m.regexEditing {
+		return m.viewRegexEditor()
 	}
 	rule := stRule.Render(strings.Repeat("─", m.dividerWidth()))
 
@@ -467,6 +971,152 @@ func (m model) viewPicker() string {
 	return join(b)
 }
 
+func (m model) viewRegexEditor() string {
+	rule := stRule.Render(strings.Repeat("─", m.dividerWidth()))
+
+	var b []string
+	b = append(b, stTitle.Render("jnilog config")+stDesc.Render("   ·   exclude regex patterns"))
+	b = append(b, rule)
+	b = append(b, stDesc.Render(
+		"Each pattern is tested against the call key format:"))
+	b = append(b, stDesc.Render(
+		"  " + stHint.Render("FunctionName|ClassName::methodName(type1, type2, ...)")))
+
+	// ── carousel ────────────────────────────────────────────────────
+	cx := regexExamples[m.regexCarouselIdx]
+	var carLines []string
+
+	// Header row
+	carLines = append(carLines, fmt.Sprintf("  %s   %s",
+		stCarHead.Render("pattern carousel"),
+		stCarPage.Render(fmt.Sprintf("%d / %d", m.regexCarouselIdx+1, len(regexExamples)))))
+
+	// Blank line for breathing room
+	carLines = append(carLines, "")
+
+	// Pattern on its own line with a label
+	carLines = append(carLines, fmt.Sprintf("  %s   %s",
+		stKey.Render("pattern"), stCarPat.Render(cx.pattern)))
+
+	// Hint on its own line with a label
+	carLines = append(carLines, fmt.Sprintf("  %s      %s",
+		stKey.Render("hint"), stDesc.Render(cx.hint)))
+
+	// Blank line before matches
+	carLines = append(carLines, "")
+
+	// Matches section
+	carLines = append(carLines, fmt.Sprintf("  %s", stKey.Render("matches")))
+	for _, m := range cx.matches {
+		disp := m
+		const carMatchMax = 56
+		if len(disp) > carMatchMax {
+			disp = disp[:carMatchMax-1] + "…"
+		}
+		carLines = append(carLines, "    "+stCarYes.Render("✓  "+disp))
+	}
+
+	// Blank line before skips
+	carLines = append(carLines, "")
+
+	// Skips section
+	carLines = append(carLines, fmt.Sprintf("  %s", stKey.Render("skips")))
+	for _, s := range cx.skips {
+		disp := s
+		const carSkipMax = 56
+		if len(disp) > carSkipMax {
+			disp = disp[:carSkipMax-1] + "…"
+		}
+		carLines = append(carLines, "    "+stCarNo.Render("✗  "+disp))
+	}
+
+	carInner := join(carLines)
+	carBox := stCarousel.Render(carInner)
+	b = append(b, carBox)
+	b = append(b, rule)
+
+	const maxRows = 14
+
+	// Find the cursor window.
+	start := 0
+	if m.regexCursor >= maxRows {
+		start = m.regexCursor - maxRows + 1
+	}
+	if start > len(m.regexList) {
+		start = 0
+	}
+
+	for i := start; i < len(m.regexList) && i < start+maxRows; i++ {
+		cur := "  "
+		if i == m.regexCursor {
+			cur = stCursor.Render("▌ ")
+		}
+
+		pat := m.regexList[i]
+		hint := callKeyHint(pat)
+
+		// If we're editing this line, show the input widget.
+		if m.regexEditing && m.regexLineIdx == i {
+			line := fmt.Sprintf("%s%2d  %s", cur, i+1, m.regexInput.View())
+			b = append(b, line)
+			b = append(b, fmt.Sprintf("     %s", stHint.Render("→ "+hint)))
+		} else if pat == "" {
+			line := fmt.Sprintf("%s%2d  %s", cur, i+1, stOff.Render("(empty)"))
+			b = append(b, line)
+			b = append(b, fmt.Sprintf("     %s", stHint.Render("→ "+hint)))
+		} else {
+			// Highlight invalid patterns.
+			style := stPreview
+			if _, err := regexp.Compile(pat); err != nil {
+				style = stErr
+			}
+			// Truncate long patterns.
+			disp := pat
+			const maxPatWidth = 64
+			if len(disp) > maxPatWidth {
+				disp = disp[:maxPatWidth-1] + "…"
+			}
+			line := fmt.Sprintf("%s%2d  %s", cur, i+1, style.Render(disp))
+			b = append(b, line)
+			b = append(b, fmt.Sprintf("     %s", stHint.Render("→ "+hint)))
+		}
+	}
+
+	// "add new" row — only if we're not at the last visible line.
+	if len(m.regexList) < start+maxRows || m.regexCursor >= len(m.regexList) {
+		cur := "  "
+		if m.regexCursor >= len(m.regexList) {
+			cur = stCursor.Render("▌ ")
+		}
+		b = append(b, cur+stInclude.Render("+ add new pattern"))
+	}
+
+	if n := len(m.regexList); n > start+maxRows {
+		b = append(b, stOff.Render(fmt.Sprintf("  … %d total", n)))
+	}
+
+	b = append(b, rule)
+	count := 0
+	for _, pat := range m.regexList {
+		if strings.TrimSpace(pat) != "" {
+			count++
+		}
+	}
+	b = append(b, stDesc.Render(fmt.Sprintf("%d pattern(s)", count)))
+	b = append(b, m.regexEditorHelp())
+	return join(b)
+}
+
+func (m model) regexEditorHelp() string {
+	if m.regexLineIdx >= 0 {
+		return stDesc.Render("editing — ") + stKey.Render("enter") + stDesc.Render(" commit   ") +
+			stKey.Render("esc") + stDesc.Render(" cancel")
+	}
+	k := func(key, what string) string { return stKey.Render(key) + stDesc.Render(" "+what+"   ") }
+	return k("↑↓", "move") + k("enter", "edit") + k("a", "add") +
+		k("d", "delete") + k("[", "prev ex") + k("]", "next ex") + k("esc", "done")
+}
+
 func (m model) pickerHelp() string {
 	k := func(key, what string) string { return stKey.Render(key) + stDesc.Render(" "+what+"   ") }
 	return k("type", "filter") + k("↑↓", "move") + k("space", "toggle") +
@@ -509,9 +1159,26 @@ func (m model) renderRow(r row, sel bool) string {
 	case rowExcludeFns:
 		return m.fnRow("exclude fns", m.cs.excludeFns, rowExcludeFns, "function names to suppress (e.g. DeleteLocalRef)")
 	case rowExcludeRegex:
-		return m.fnRow("excl. regex", m.cs.excludeRegex, rowExcludeRegex, "regex on call keys: fn|class::method(args): ret")
+		return m.regexRow("excl. regex", m.cs.excludeRegex, "regex on call keys: JniName|Class::method(args)")
 	}
 	return ""
+}
+
+func (m model) regexRow(label string, vals []string, desc string) string {
+	if len(vals) == 0 {
+		return fmt.Sprintf("%s  %s  %s", stKey.Render(label), stOff.Render("(none)"), stDesc.Render(desc))
+	}
+	// Show count and a summary hint for the first pattern.
+	first := vals[0]
+	hint := callKeyHint(first)
+	const maxw = 40
+	if len(first) > maxw {
+		first = first[:maxw-1] + "…"
+	}
+	return fmt.Sprintf("%s  %s  %s  [%s]", stKey.Render(label),
+		stPreview.Render(first),
+		stDesc.Render(fmt.Sprintf("(%d pattern(s))", len(vals))),
+		stHint.Render(hint))
 }
 
 func (m model) fnRow(label string, vals []string, k rowKind, desc string) string {
